@@ -79,7 +79,7 @@ static void draw_cursor(int x, int y)
 
 int main(void)
 {
-    struct mouse_data md;
+  PS2MouseData md;
     int mx = 320, my = 224;
 
     load_modules();
