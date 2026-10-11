@@ -1,0 +1,14 @@
+name: Build PS2 ELF
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ps2dev/ps2dev:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ps2xp-elf
+          path: ps2xp.elf
