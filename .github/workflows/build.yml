@@ -2,8 +2,10 @@ name: Build PS2 ELF
 on: [push, workflow_dispatch]
 jobs:
   build:
-    runs-on: ubuntu-latest
-    container: ps2dev/ps2dev:latest
+   - name: Install make
+        run: apk add --no-cache make git
+      - name: Build
+        run: make
     steps:
       - uses: actions/checkout@v4
       - name: Build
