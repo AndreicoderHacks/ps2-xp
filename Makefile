@@ -1,8 +1,8 @@
 EE_BIN = ps2xp.elf
-EE_OBJS = src/main.o usbd_irx.o ps2mouse_irx.o ps2kbd_irx.o
+EE_OBJS = src/main.o usbd_irx.o ps2mouse_irx.o ps2kbd_irx.o iomanX_irx.o fileXio_irx.o bdm_irx.o bdmfs_fatfs_irx.o usbmass_bd_irx.o
 EE_INCS += -I$(PS2DEV)/gsKit/include
 EE_LDFLAGS += -L$(PS2DEV)/gsKit/lib
-EE_LIBS = -lgskit -ldmakit -lmouse -lkbd -lpatches -ldebug -lc
+EE_LIBS = -lgskit -ldmakit -lmouse -lkbd -lfileXio -lpatches -ldebug -lc
 
 all: $(EE_BIN)
 
