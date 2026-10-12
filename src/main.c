@@ -12,8 +12,8 @@
 #include <gsKit.h>
 #include <dmaKit.h>
 #include <libmouse.h>
-#include <fileXio_rpc.h>
-#include <iox_stat.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "font.h"
 
 extern unsigned char usbd_irx[];     extern unsigned int size_usbd_irx;
@@ -58,7 +58,6 @@ static void load_modules(void)
     SifExecModuleBuffer(usbmass_bd_irx, size_usbmass_bd_irx, 0, NULL, &ret);
     SifExecModuleBuffer(ps2mouse_irx, size_ps2mouse_irx, 0, NULL, &ret);
     SifExecModuleBuffer(ps2kbd_irx, size_ps2kbd_irx, 0, NULL, &ret);
-    fileXioInit();
 }
 
 static void init_gs(void)
@@ -146,18 +145,30 @@ static int fm_is_root(void) { return strcmp(fm.path, "mass:/") == 0; }
 
 static int fm_load(const char *path)
 {
-    iox_dirent_t de;
-    int fd, start;
-    fd = fileXioDopen(path);
-    if (fd < 0) return fd;
+    DIR *dir;
+    struct dirent *de;
+    int start;
+    dir = opendir(path);
+    if (!dir) return -1;
     fm.count = 0; fm.scroll = 0; fm.sel = -1;
     if (strcmp(path, "mass:/") != 0) fm_add("..", 1, 0);
     start = fm.count;
-    while (fileXioDread(fd, &de) > 0) {
-        if (!strcmp(de.name, ".") || !strcmp(de.name, "..")) continue;
-        fm_add(de.name, FIO_S_ISDIR(de.stat.mode) ? 1 : 0, de.stat.size);
+    while ((de = readdir(dir)) != NULL) {
+        struct stat st;
+        char fullpath[512];
+        int is_dir = 0;
+        unsigned int size = 0;
+
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (snprintf(fullpath, sizeof(fullpath), "%s%s%s", path,
+                     (path[0] && path[strlen(path) - 1] != '/') ? "/" : "",
+                     de->d_name) < (int)sizeof(fullpath) && stat(fullpath, &st) == 0) {
+            is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+            if (st.st_size > 0) size = (unsigned int)st.st_size;
+        }
+        fm_add(de->d_name, is_dir, size);
     }
-    fileXioDclose(fd);
+    closedir(dir);
     qsort(fm.e + start, fm.count - start, sizeof(FMEntry), fm_cmp);
     return 0;
 }
