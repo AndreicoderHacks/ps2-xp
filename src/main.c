@@ -77,28 +77,50 @@ static void draw_cursor(int x, int y)
     for (i = 1; i < 11; i++) rect(x + 1, y + i, x + 1 + i / 2 + 1, y + i + 1, RGB(255, 255, 255));
 }
 
+static void draw_debug(u32 en, u32 buttons)
+{
+    int H = gs->Height, i;
+    // green = mouse detected, red = not detected
+    rect(100, H - 24, 114, H - 6, en > 0 ? RGB(0, 255, 0) : RGB(255, 0, 0));
+    // mouse buttons (yellow when pressed)
+    for (i = 0; i < 3; i++)
+        rect(122 + i * 18, H - 24, 136 + i * 18, H - 6, (buttons & (1 << i)) ? RGB(255, 255, 0) : RGB(30, 30, 60));
+}
+
 int main(void)
 {
-  PS2MouseData md;
-    int mx = 320, my = 224;
+    PS2MouseData md;
+    int mx = 320, my = 224, frame = 0, configured = 0;
+    u32 en = 0, buttons = 0;
 
     load_modules();
     init_gs();
     PS2MouseInit();
-    PS2MouseSetReadMode(PS2MOUSE_READMODE_DIFF);
 
     while (1) {
-        if (PS2MouseRead(&md) >= 0) {
-            mx += md.x; my += md.y;
+        // poll until the mouse is enumerated, then configure once
+        if (!configured && (frame % 30) == 0) {
+            en = PS2MouseEnum();
+            if (en > 0) {
+                PS2MouseSetReadMode(PS2MOUSE_READMODE_ABS);
+                PS2MouseSetBoundary(0, gs->Width - 1, 0, gs->Height - 1);
+                PS2MouseSetPosition(gs->Width / 2, gs->Height / 2);
+                configured = 1;
+            }
+        }
+        if (configured && PS2MouseRead(&md) >= 0) {
+            mx = md.x; my = md.y; buttons = md.buttons;
             if (mx < 0) mx = 0;
             if (my < 0) my = 0;
             if (mx > gs->Width - 1) mx = gs->Width - 1;
             if (my > gs->Height - 1) my = gs->Height - 1;
         }
         draw_desktop();
+        draw_debug(en, buttons);
         draw_cursor(mx, my);
         gsKit_queue_exec(gs);
         gsKit_sync_flip(gs);
+        frame++;
     }
     return 0;
 }
