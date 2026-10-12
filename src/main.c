@@ -1,6 +1,8 @@
 // PS2 XP-style desktop - step 2: window system, icons, taskbar, drag
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <stdlib.h>
 #include <tamtypes.h>
 #include <kernel.h>
 #include <sifrpc.h>
@@ -10,11 +12,18 @@
 #include <gsKit.h>
 #include <dmaKit.h>
 #include <libmouse.h>
+#include <fileXio_rpc.h>
+#include <iox_stat.h>
 #include "font.h"
 
 extern unsigned char usbd_irx[];     extern unsigned int size_usbd_irx;
 extern unsigned char ps2mouse_irx[]; extern unsigned int size_ps2mouse_irx;
 extern unsigned char ps2kbd_irx[];   extern unsigned int size_ps2kbd_irx;
+extern unsigned char iomanX_irx[];   extern unsigned int size_iomanX_irx;
+extern unsigned char fileXio_irx[];  extern unsigned int size_fileXio_irx;
+extern unsigned char bdm_irx[];      extern unsigned int size_bdm_irx;
+extern unsigned char bdmfs_fatfs_irx[]; extern unsigned int size_bdmfs_fatfs_irx;
+extern unsigned char usbmass_bd_irx[];  extern unsigned int size_usbmass_bd_irx;
 
 #define RGB(r,g,b) GS_SETREG_RGBAQ(r,g,b,0x80,0)
 #define TASKBAR_H 30
@@ -41,9 +50,15 @@ static void load_modules(void)
     SifInitRpc(0);
     sbv_patch_enable_lmb();
     sbv_patch_disable_prefix_check();
+    SifExecModuleBuffer(iomanX_irx, size_iomanX_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(fileXio_irx, size_fileXio_irx, 0, NULL, &ret);
     SifExecModuleBuffer(usbd_irx, size_usbd_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(bdm_irx, size_bdm_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(bdmfs_fatfs_irx, size_bdmfs_fatfs_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(usbmass_bd_irx, size_usbmass_bd_irx, 0, NULL, &ret);
     SifExecModuleBuffer(ps2mouse_irx, size_ps2mouse_irx, 0, NULL, &ret);
     SifExecModuleBuffer(ps2kbd_irx, size_ps2kbd_irx, 0, NULL, &ret);
+    fileXioInit();
 }
 
 static void init_gs(void)
@@ -99,6 +114,150 @@ static void draw_text(int x, int y, const char *s, int maxc, int sc, u64 col)
     while (*s && n < maxc) { draw_char(x, y, *s, sc, col); x += 6 * sc; s++; n++; }
 }
 
+/* ---------- file manager (My Computer) ---------- */
+#define FM_MAX 256
+typedef struct { char name[40]; int dir; unsigned int size; } FMEntry;
+static struct {
+    char path[256];
+    FMEntry e[FM_MAX];
+    int count, scroll, sel, demo;
+    char msg[48];
+    int last_row, last_frame;
+} fm;
+
+static int fm_cmp(const void *a, const void *b)
+{
+    const FMEntry *x = a, *y = b;
+    if (x->dir != y->dir) return y->dir - x->dir;
+    return strcasecmp(x->name, y->name);
+}
+
+static void fm_add(const char *name, int dir, unsigned int size)
+{
+    if (fm.count >= FM_MAX) return;
+    strncpy(fm.e[fm.count].name, name, 39);
+    fm.e[fm.count].name[39] = 0;
+    fm.e[fm.count].dir = dir;
+    fm.e[fm.count].size = size;
+    fm.count++;
+}
+
+static int fm_is_root(void) { return strcmp(fm.path, "mass:/") == 0; }
+
+static int fm_load(const char *path)
+{
+    iox_dirent_t de;
+    int fd, start;
+    fd = fileXioDopen(path);
+    if (fd < 0) return fd;
+    fm.count = 0; fm.scroll = 0; fm.sel = -1;
+    if (strcmp(path, "mass:/") != 0) fm_add("..", 1, 0);
+    start = fm.count;
+    while (fileXioDread(fd, &de) > 0) {
+        if (!strcmp(de.name, ".") || !strcmp(de.name, "..")) continue;
+        fm_add(de.name, FIO_S_ISDIR(de.stat.mode) ? 1 : 0, de.stat.size);
+    }
+    fileXioDclose(fd);
+    qsort(fm.e + start, fm.count - start, sizeof(FMEntry), fm_cmp);
+    return 0;
+}
+
+static void fm_demo(void)
+{
+    fm.count = 0; fm.scroll = 0; fm.sel = -1; fm.demo = 1;
+    fm_add("PHOTOS", 1, 0); fm_add("MUSIC", 1, 0); fm_add("GAMES", 1, 0);
+    fm_add("WALLPAPER.JPG", 0, 245000); fm_add("SONG.MP3", 0, 4100000); fm_add("README.TXT", 0, 1200);
+}
+
+static void fm_refresh(void)
+{
+    int r;
+    if (!fm.path[0]) strcpy(fm.path, "mass:/");
+    r = fm_load(fm.path);
+    if (r < 0) {
+        snprintf(fm.msg, sizeof(fm.msg), "NO USB (ERR %d) - DEMO LIST", r);
+        fm_demo();
+    } else { fm.demo = 0; fm.msg[0] = 0; }
+}
+
+static void fm_up(void)
+{
+    char *p;
+    int n;
+    if (fm.demo || fm_is_root()) return;
+    n = strlen(fm.path);
+    if (n > 0 && fm.path[n - 1] == '/') fm.path[n - 1] = 0;
+    p = strrchr(fm.path, '/');
+    if (p) p[1] = 0;
+    if (fm_load(fm.path) < 0) fm_refresh();
+}
+
+static void fm_enter(int idx)
+{
+    char old[256];
+    if (idx < 0 || idx >= fm.count || !fm.e[idx].dir) return;
+    if (!strcmp(fm.e[idx].name, "..")) { fm_up(); return; }
+    if (fm.demo) return;
+    strcpy(old, fm.path);
+    strncat(fm.path, fm.e[idx].name, sizeof(fm.path) - strlen(fm.path) - 2);
+    strcat(fm.path, "/");
+    if (fm_load(fm.path) < 0) { strcpy(fm.path, old); fm_load(fm.path); }
+}
+
+static const int fm_bx[4] = {6, 48, 104, 136};
+static const int fm_bw[4] = {36, 50, 28, 28};
+static const char *fm_bl[4] = {"UP", "REFR", "^", "V"};
+
+static int fm_vis(Win *w) { return (w->h - TITLE_H - 38 - 6) / 14; }
+
+static void draw_fm(Win *w)
+{
+    int i, r, vis = fm_vis(w);
+    int bx = w->x + 3, by = w->y + TITLE_H;
+    char buf[32];
+    for (i = 0; i < 4; i++) {
+        rect(bx + fm_bx[i], by + 4, bx + fm_bx[i] + fm_bw[i], by + 20, RGB(180, 180, 190));
+        rect(bx + fm_bx[i] + 1, by + 5, bx + fm_bx[i] + fm_bw[i] - 1, by + 19, RGB(225, 225, 232));
+        draw_text(bx + fm_bx[i] + 6, by + 9, fm_bl[i], 5, 1, RGB(30, 30, 30));
+    }
+    if (fm.demo) draw_text(bx + 6, by + 24, fm.msg, 52, 1, RGB(200, 30, 30));
+    else         draw_text(bx + 6, by + 24, fm.path, 52, 1, RGB(60, 60, 60));
+    rect(bx + 3, by + 36, w->x + w->w - 6, w->y + w->h - 6, RGB(255, 255, 255));
+    for (r = 0; r < vis; r++) {
+        int idx = fm.scroll + r, ry = by + 40 + r * 14;
+        if (idx >= fm.count) break;
+        if (idx == fm.sel) rect(bx + 4, ry - 2, w->x + w->w - 7, ry + 11, RGB(50, 90, 200));
+        u64 tc = (idx == fm.sel) ? RGB(255, 255, 255) : RGB(20, 20, 20);
+        rect(bx + 8, ry, bx + 18, ry + 9, fm.e[idx].dir ? RGB(240, 200, 60) : RGB(150, 160, 190));
+        draw_text(bx + 24, ry + 1, fm.e[idx].name, 24, 1, tc);
+        if (!fm.e[idx].dir) {
+            snprintf(buf, sizeof(buf), "%u KB", (fm.e[idx].size + 1023) / 1024);
+            draw_text(w->x + w->w - 80, ry + 1, buf, 12, 1, tc);
+        }
+    }
+}
+
+static void fm_click(Win *w, int mx, int my, int frame)
+{
+    int i, bx = w->x + 3, by = w->y + TITLE_H, vis = fm_vis(w);
+    for (i = 0; i < 4; i++) {
+        if (mx >= bx + fm_bx[i] && mx < bx + fm_bx[i] + fm_bw[i] && my >= by + 4 && my < by + 20) {
+            if (i == 0) fm_up();
+            else if (i == 1) fm_refresh();
+            else if (i == 2) { if (fm.scroll > 0) fm.scroll -= 3; if (fm.scroll < 0) fm.scroll = 0; }
+            else { if (fm.scroll + vis < fm.count) fm.scroll += 3; }
+            return;
+        }
+    }
+    if (my >= by + 38 && mx >= bx + 3 && mx < w->x + w->w - 6) {
+        int row = (my - (by + 38)) / 14, idx = fm.scroll + row;
+        if (row < vis && idx < fm.count) {
+            if (idx == fm.last_row && frame - fm.last_frame < 30) { fm_enter(idx); fm.last_row = -1; }
+            else { fm.sel = idx; fm.last_row = idx; fm.last_frame = frame; }
+        }
+    }
+}
+
 /* ---------- window manager ---------- */
 static int top_slot(void) { return nopen ? order[nopen - 1] : -1; }
 
@@ -129,11 +288,12 @@ static void open_app(int app)
     if (slot < 0) return;
     wins[slot].open = 1;
     wins[slot].app = app;
-    wins[slot].w = 300;
-    wins[slot].h = 200;
-    wins[slot].x = 120 + (nopen % 6) * 28;
-    wins[slot].y = 40 + (nopen % 6) * 28;
+    wins[slot].w = (app == 0) ? 380 : 300;
+    wins[slot].h = (app == 0) ? 290 : 200;
+    wins[slot].x = 110 + (nopen % 6) * 28;
+    wins[slot].y = 20 + (nopen % 6) * 28;
     order[nopen++] = slot;
+    if (app == 0) fm_refresh();
 }
 
 static void draw_window(int slot, int active)
@@ -151,7 +311,8 @@ static void draw_window(int slot, int active)
     draw_text(x + w->w - 16, y + 7, "X", 1, 1, RGB(255, 255, 255));
     // body
     rect(x + 3, y + TITLE_H, x + w->w - 3, y + w->h - 3, RGB(236, 233, 216));
-    draw_text(x + 20, y + 80, "COMING SOON", 20, 2, RGB(90, 90, 90));
+    if (w->app == 0) draw_fm(w);
+    else draw_text(x + 20, y + 80, "COMING SOON", 20, 2, RGB(90, 90, 90));
 }
 
 /* ---------- desktop ---------- */
@@ -263,7 +424,7 @@ int main(void)
                         if (mx >= w->x + w->w - 20 && mx < w->x + w->w - 4 && my >= w->y + 3 && my < w->y + 19)
                             close_win(s);
                         else { drag = s; dox = mx - w->x; doy = my - w->y; }
-                    }
+                    } else if (w->app == 0) fm_click(w, mx, my, frame);
                     handled = 1;
                 }
             }
