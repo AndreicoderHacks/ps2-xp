@@ -591,10 +591,11 @@ int main(void)
         // ----- draw -----
         g_frame = frame;
         if (frame == 300 || frame == 900) wp_try_cfg();
-        if (wp_ready)
+        if (wp_ready) {
             gsKit_prim_sprite_texture(gs, &wp_tex, 0, 0, 0, 0, W, H - TASKBAR_H, WP_W, WP_H, 1, GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0));
-        else
+        } else {
             vgrad(0, 0, W, H - TASKBAR_H, 60, 110, 200, 160, 200, 250);
+        }
         for (i = 0; i < NAPPS; i++) draw_icon(i, i == sel_icon);
         for (i = 0; i < nopen; i++) draw_window(order[i], i == nopen - 1);
         draw_taskbar(top_slot());
