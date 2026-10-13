@@ -3,6 +3,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <tamtypes.h>
 #include <kernel.h>
 #include <sifrpc.h>
@@ -15,6 +16,14 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include "font.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_NO_STDIO
+#define STBI_NO_LINEAR
+#define STBI_NO_HDR
+#define STBI_NO_THREAD_LOCALS
+#include "stb_image.h"
 
 extern unsigned char usbd_irx[];     extern unsigned int size_usbd_irx;
 extern unsigned char ps2mouse_irx[]; extern unsigned int size_ps2mouse_irx;
@@ -113,6 +122,114 @@ static void draw_text(int x, int y, const char *s, int maxc, int sc, u64 col)
     while (*s && n < maxc) { draw_char(x, y, *s, sc, col); x += 6 * sc; s++; n++; }
 }
 
+/* ---------- status line + wallpaper (JPEG) ---------- */
+#define WP_W 512
+#define WP_H 512
+#define WP_CFG "mass:/ps2xp.cfg"
+
+static GSTEXTURE wp_tex;
+static int wp_ready = 0, wp_alloc = 0;
+static char status[64];
+static int status_until = 0, g_frame = 0;
+
+static void set_status(const char *m)
+{
+    strncpy(status, m, sizeof(status) - 1);
+    status[sizeof(status) - 1] = 0;
+    status_until = g_frame + 240;
+}
+
+static void wp_save_cfg(const char *path)
+{
+    FILE *f = fopen(WP_CFG, "w");
+    if (!f) return;
+    fputs(path, f);
+    fclose(f);
+}
+
+static int wp_load(const char *path, int quiet)
+{
+    FILE *f;
+    long sz;
+    unsigned char *buf, *img;
+    int w, h, c, x, y;
+    unsigned short *dst;
+
+    f = fopen(path, "rb");
+    if (!f) { if (!quiet) set_status("CANT OPEN FILE"); return -1; }
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 6 * 1024 * 1024) { fclose(f); if (!quiet) set_status("FILE TOO BIG (MAX 6 MB)"); return -1; }
+    buf = malloc(sz);
+    if (!buf) { fclose(f); if (!quiet) set_status("OUT OF MEMORY"); return -1; }
+    if (fread(buf, 1, sz, f) != (size_t)sz) { fclose(f); free(buf); if (!quiet) set_status("READ ERROR"); return -1; }
+    fclose(f);
+
+    if (!stbi_info_from_memory(buf, (int)sz, &w, &h, &c) || (long)w * h > 4200000) {
+        free(buf);
+        if (!quiet) set_status("NOT A JPEG OR TOO BIG (MAX 4 MP)");
+        return -1;
+    }
+    img = stbi_load_from_memory(buf, (int)sz, &w, &h, &c, 3);
+    free(buf);
+    if (!img) { if (!quiet) set_status("JPEG DECODE FAILED"); return -1; }
+
+    if (!wp_tex.Mem) wp_tex.Mem = memalign(128, WP_W * WP_H * 2);
+    if (!wp_tex.Mem) { stbi_image_free(img); if (!quiet) set_status("OUT OF MEMORY"); return -1; }
+    dst = (unsigned short *)wp_tex.Mem;
+    for (y = 0; y < WP_H; y++) {
+        int sy = y * h / WP_H;
+        for (x = 0; x < WP_W; x++) {
+            int sx = x * w / WP_W;
+            unsigned char *p = img + (sy * w + sx) * 3;
+            dst[y * WP_W + x] = (p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10) | 0x8000;
+        }
+    }
+    stbi_image_free(img);
+
+    wp_tex.Width = WP_W;
+    wp_tex.Height = WP_H;
+    wp_tex.PSM = GS_PSM_CT16;
+    wp_tex.Filter = GS_FILTER_LINEAR;
+    if (!wp_alloc) {
+        wp_tex.Vram = gsKit_vram_alloc(gs, gsKit_texture_size(WP_W, WP_H, GS_PSM_CT16), GSKIT_ALLOC_USERBUFFER);
+        wp_alloc = 1;
+    }
+    gsKit_texture_upload(gs, &wp_tex);
+    wp_ready = 1;
+    wp_save_cfg(path);
+    if (!quiet) set_status("WALLPAPER SET");
+    return 0;
+}
+
+static void wp_try_cfg(void)
+{
+    char path[300];
+    FILE *f;
+    int n;
+    if (wp_ready) return;
+    f = fopen(WP_CFG, "r");
+    if (!f) return;
+    n = fread(path, 1, sizeof(path) - 1, f);
+    fclose(f);
+    if (n <= 0) return;
+    path[n] = 0;
+    while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r')) path[--n] = 0;
+    wp_load(path, 1);
+}
+
+static void wp_clear(void)
+{
+    wp_ready = 0;
+    remove(WP_CFG);
+    set_status("WALLPAPER RESET");
+}
+
+static int is_jpg(const char *n)
+{
+    int l = strlen(n);
+    return (l > 4 && !strcasecmp(n + l - 4, ".jpg")) || (l > 5 && !strcasecmp(n + l - 5, ".jpeg"));
+}
+
 /* ---------- file manager (My Computer) ---------- */
 #define FM_MAX 256
 typedef struct { char name[40]; int dir; unsigned int size; } FMEntry;
@@ -206,7 +323,18 @@ static void fm_up(void)
 static void fm_enter(int idx)
 {
     char old[256];
-    if (idx < 0 || idx >= fm.count || !fm.e[idx].dir) return;
+    if (idx < 0 || idx >= fm.count) return;
+    if (!fm.e[idx].dir) {
+        if (is_jpg(fm.e[idx].name)) {
+            if (fm.demo) set_status("NO USB - CANT SET WALLPAPER");
+            else {
+                char full[300];
+                snprintf(full, sizeof(full), "%s%s", fm.path, fm.e[idx].name);
+                wp_load(full, 0);
+            }
+        }
+        return;
+    }
     if (!strcmp(fm.e[idx].name, "..")) { fm_up(); return; }
     if (fm.demo) return;
     strcpy(old, fm.path);
@@ -215,9 +343,9 @@ static void fm_enter(int idx)
     if (fm_load(fm.path) < 0) { strcpy(fm.path, old); fm_load(fm.path); }
 }
 
-static const int fm_bx[4] = {6, 48, 104, 136};
-static const int fm_bw[4] = {36, 50, 28, 28};
-static const char *fm_bl[4] = {"UP", "REFR", "^", "V"};
+static const int fm_bx[5] = {6, 48, 104, 136, 168};
+static const int fm_bw[5] = {36, 50, 28, 28, 52};
+static const char *fm_bl[5] = {"UP", "REFR", "^", "V", "NOWP"};
 
 static int fm_vis(Win *w) { return (w->h - TITLE_H - 38 - 6) / 14; }
 
@@ -226,7 +354,7 @@ static void draw_fm(Win *w)
     int i, r, vis = fm_vis(w);
     int bx = w->x + 3, by = w->y + TITLE_H;
     char buf[32];
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         rect(bx + fm_bx[i], by + 4, bx + fm_bx[i] + fm_bw[i], by + 20, RGB(180, 180, 190));
         rect(bx + fm_bx[i] + 1, by + 5, bx + fm_bx[i] + fm_bw[i] - 1, by + 19, RGB(225, 225, 232));
         draw_text(bx + fm_bx[i] + 6, by + 9, fm_bl[i], 5, 1, RGB(30, 30, 30));
@@ -251,11 +379,12 @@ static void draw_fm(Win *w)
 static void fm_click(Win *w, int mx, int my, int frame)
 {
     int i, bx = w->x + 3, by = w->y + TITLE_H, vis = fm_vis(w);
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         if (mx >= bx + fm_bx[i] && mx < bx + fm_bx[i] + fm_bw[i] && my >= by + 4 && my < by + 20) {
             if (i == 0) fm_up();
             else if (i == 1) fm_refresh();
             else if (i == 2) { if (fm.scroll > 0) fm.scroll -= 3; if (fm.scroll < 0) fm.scroll = 0; }
+            else if (i == 4) wp_clear();
             else { if (fm.scroll + vis < fm.count) fm.scroll += 3; }
             return;
         }
@@ -460,10 +589,20 @@ int main(void)
         prev = buttons;
 
         // ----- draw -----
-        vgrad(0, 0, W, H - TASKBAR_H, 60, 110, 200, 160, 200, 250);
+        g_frame = frame;
+        if (frame == 300 || frame == 900) wp_try_cfg();
+        if (wp_ready)
+            gsKit_prim_sprite_texture(gs, &wp_tex, 0, 0, 0, 0, W, H - TASKBAR_H, WP_W, WP_H, 1, GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0));
+        else
+            vgrad(0, 0, W, H - TASKBAR_H, 60, 110, 200, 160, 200, 250);
         for (i = 0; i < NAPPS; i++) draw_icon(i, i == sel_icon);
         for (i = 0; i < nopen; i++) draw_window(order[i], i == nopen - 1);
         draw_taskbar(top_slot());
+        if (frame < status_until) {
+            int tw = strlen(status) * 6 + 12;
+            rect(W / 2 - tw / 2, 6, W / 2 + tw / 2, 24, RGB(20, 20, 40));
+            draw_text(W / 2 - tw / 2 + 6, 12, status, 60, 1, RGB(255, 255, 255));
+        }
         draw_debug(en, buttons);
         draw_cursor(mx, my);
         gsKit_queue_exec(gs);
