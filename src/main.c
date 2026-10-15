@@ -480,6 +480,144 @@ static void draw_menu(int mx, int my)
     }
 }
 
+/* ---------- Minesweeper (9x9, 10 mines) ---------- */
+#define MS_N 9
+#define MS_MINES 10
+#define MS_C 20
+static struct {
+    unsigned char mine[MS_N][MS_N], rev[MS_N][MS_N], flag[MS_N][MS_N], adj[MS_N][MS_N];
+    int state;                 // 0 ready, 1 playing, 2 won, 3 lost
+    int flags, revealed, start_frame, end_secs, exx, exy;
+} ms;
+
+static void ms_reset(void) { memset(&ms, 0, sizeof(ms)); ms.exx = ms.exy = -1; }
+
+static void ms_place(int sx, int sy)
+{
+    int placed = 0, x, y, dx, dy;
+    srand(g_frame * 7919 + 13);
+    while (placed < MS_MINES) {
+        x = rand() % MS_N; y = rand() % MS_N;
+        if (ms.mine[y][x] || (abs(x - sx) <= 1 && abs(y - sy) <= 1)) continue;
+        ms.mine[y][x] = 1; placed++;
+    }
+    for (y = 0; y < MS_N; y++)
+        for (x = 0; x < MS_N; x++) {
+            int n = 0;
+            for (dy = -1; dy <= 1; dy++)
+                for (dx = -1; dx <= 1; dx++) {
+                    int nx = x + dx, ny = y + dy;
+                    if (nx >= 0 && ny >= 0 && nx < MS_N && ny < MS_N && ms.mine[ny][nx]) n++;
+                }
+            ms.adj[y][x] = n;
+        }
+}
+
+static void ms_reveal(int x0, int y0)
+{
+    int stack[MS_N * MS_N * 8], sp = 0, dx, dy;
+    stack[sp++] = y0 * MS_N + x0;
+    while (sp > 0) {
+        int c = stack[--sp], cx = c % MS_N, cy = c / MS_N;
+        if (ms.rev[cy][cx] || ms.flag[cy][cx]) continue;
+        ms.rev[cy][cx] = 1; ms.revealed++;
+        if (ms.adj[cy][cx] == 0 && !ms.mine[cy][cx])
+            for (dy = -1; dy <= 1; dy++)
+                for (dx = -1; dx <= 1; dx++) {
+                    int nx = cx + dx, ny = cy + dy;
+                    if (nx >= 0 && ny >= 0 && nx < MS_N && ny < MS_N && !ms.rev[ny][nx] && sp < MS_N * MS_N * 8 - 1)
+                        stack[sp++] = ny * MS_N + nx;
+                }
+    }
+}
+
+static int ms_secs(void)
+{
+    int t = (ms.state == 1) ? (g_frame - ms.start_frame) / 50 : ms.end_secs;
+    return t > 999 ? 999 : t;
+}
+
+static void ms_click(Win *w, int mx, int my, int right)
+{
+    int bx = w->x + 9, by = w->y + TITLE_H + 36;
+    int sx = w->x + w->w / 2 - 12, sy = w->y + TITLE_H + 6;
+    int cx, cy;
+    if (!right && mx >= sx && mx < sx + 24 && my >= sy && my < sy + 24) { ms_reset(); return; }
+    if (ms.state >= 2) return;
+    if (mx < bx || my < by || mx >= bx + MS_N * MS_C || my >= by + MS_N * MS_C) return;
+    cx = (mx - bx) / MS_C; cy = (my - by) / MS_C;
+    if (right) {
+        if (ms.rev[cy][cx]) return;
+        if (ms.flag[cy][cx]) { ms.flag[cy][cx] = 0; ms.flags--; }
+        else { ms.flag[cy][cx] = 1; ms.flags++; }
+        return;
+    }
+    if (ms.flag[cy][cx] || ms.rev[cy][cx]) return;
+    if (ms.state == 0) { ms_place(cx, cy); ms.state = 1; ms.start_frame = g_frame; }
+    if (ms.mine[cy][cx]) {
+        ms.state = 3; ms.exx = cx; ms.exy = cy;
+        ms.end_secs = (g_frame - ms.start_frame) / 50;
+        return;
+    }
+    ms_reveal(cx, cy);
+    if (ms.revealed == MS_N * MS_N - MS_MINES) {
+        ms.state = 2;
+        ms.end_secs = (g_frame - ms.start_frame) / 50;
+        ms.flags = MS_MINES;
+    }
+}
+
+static void draw_ms(Win *w)
+{
+    static const int nc[9][3] = {{0,0,0},{0,0,255},{0,128,0},{255,0,0},{0,0,128},{128,0,0},{0,128,128},{0,0,0},{128,128,128}};
+    int x = w->x, y = w->y + TITLE_H, cx, cy;
+    int bx = w->x + 9, by = w->y + TITLE_H + 36;
+    int sx = w->x + w->w / 2 - 12, sy = y + 6;
+    char buf[8];
+    rect(x + 3, y, x + w->w - 3, w->y + w->h - 3, RGB(192, 192, 192));
+    // counters
+    rect(x + 9, y + 8, x + 53, y + 30, RGB(0, 0, 0));
+    snprintf(buf, sizeof(buf), "%03d", MS_MINES - ms.flags);
+    draw_text(x + 13, y + 12, buf, 3, 2, RGB(255, 30, 30));
+    rect(x + w->w - 53, y + 8, x + w->w - 9, y + 30, RGB(0, 0, 0));
+    snprintf(buf, sizeof(buf), "%03d", ms_secs());
+    draw_text(x + w->w - 49, y + 12, buf, 3, 2, RGB(255, 30, 30));
+    // smiley
+    rect(sx, sy, sx + 24, sy + 24, RGB(60, 60, 60));
+    rect(sx + 1, sy + 1, sx + 23, sy + 23, RGB(250, 220, 40));
+    if (ms.state == 2) rect(sx + 4, sy + 7, sx + 20, sy + 11, RGB(0, 0, 0));
+    else { rect(sx + 7, sy + 7, sx + 10, sy + 11, RGB(0, 0, 0)); rect(sx + 14, sy + 7, sx + 17, sy + 11, RGB(0, 0, 0)); }
+    if (ms.state == 3) {
+        rect(sx + 6, sy + 17, sx + 8, sy + 19, RGB(0, 0, 0)); rect(sx + 8, sy + 15, sx + 16, sy + 17, RGB(0, 0, 0)); rect(sx + 16, sy + 17, sx + 18, sy + 19, RGB(0, 0, 0));
+    } else {
+        rect(sx + 6, sy + 14, sx + 8, sy + 16, RGB(0, 0, 0)); rect(sx + 8, sy + 16, sx + 16, sy + 18, RGB(0, 0, 0)); rect(sx + 16, sy + 14, sx + 18, sy + 16, RGB(0, 0, 0));
+    }
+    // grid
+    for (cy = 0; cy < MS_N; cy++)
+        for (cx = 0; cx < MS_N; cx++) {
+            int x0 = bx + cx * MS_C, y0 = by + cy * MS_C;
+            int show = ms.rev[cy][cx] || (ms.state == 3 && ms.mine[cy][cx] && !ms.flag[cy][cx]);
+            if (show) {
+                rect(x0, y0, x0 + MS_C, y0 + MS_C, RGB(128, 128, 128));
+                rect(x0 + 1, y0 + 1, x0 + MS_C, y0 + MS_C, (cx == ms.exx && cy == ms.exy) ? RGB(255, 40, 40) : RGB(192, 192, 192));
+                if (ms.mine[cy][cx]) rect(x0 + 6, y0 + 6, x0 + 14, y0 + 14, RGB(0, 0, 0));
+                else if (ms.adj[cy][cx] > 0) {
+                    int a = ms.adj[cy][cx];
+                    draw_char(x0 + 5, y0 + 3, '0' + a, 2, RGB(nc[a][0], nc[a][1], nc[a][2]));
+                }
+            } else {
+                rect(x0, y0, x0 + MS_C, y0 + MS_C, RGB(128, 128, 128));
+                rect(x0, y0, x0 + MS_C - 1, y0 + MS_C - 1, RGB(255, 255, 255));
+                rect(x0 + 2, y0 + 2, x0 + MS_C - 1, y0 + MS_C - 1, RGB(192, 192, 192));
+                if (ms.flag[cy][cx]) {
+                    rect(x0 + 10, y0 + 4, x0 + 12, y0 + 15, RGB(0, 0, 0));
+                    rect(x0 + 5, y0 + 4, x0 + 11, y0 + 9, RGB(230, 20, 20));
+                    rect(x0 + 6, y0 + 15, x0 + 15, y0 + 17, RGB(0, 0, 0));
+                }
+            }
+        }
+}
+
 /* ---------- window manager ---------- */
 static int top_slot(void) { return nopen ? order[nopen - 1] : -1; }
 
@@ -510,12 +648,13 @@ static void open_app(int app)
     if (slot < 0) return;
     wins[slot].open = 1;
     wins[slot].app = app;
-    wins[slot].w = (app == 0) ? 380 : 300;
-    wins[slot].h = (app == 0) ? 290 : 200;
+    wins[slot].w = (app == 0) ? 380 : (app == 1) ? 198 : 300;
+    wins[slot].h = (app == 0) ? 290 : (app == 1) ? 250 : 200;
     wins[slot].x = 110 + (nopen % 6) * 28;
     wins[slot].y = 20 + (nopen % 6) * 28;
     order[nopen++] = slot;
     if (app == 0) fm_refresh();
+    if (app == 1) ms_reset();
 }
 
 static void draw_window(int slot, int active)
@@ -535,6 +674,7 @@ static void draw_window(int slot, int active)
     rect(x + 3, y + TITLE_H, x + w->w - 3, y + w->h - 3, RGB(236, 233, 216));
     if (w->app == 0) draw_fm(w);
     else if (w->app == 4) draw_settings(w);
+    else if (w->app == 1) draw_ms(w);
     else draw_text(x + 20, y + 80, "COMING SOON", 20, 2, RGB(90, 90, 90));
 }
 
@@ -632,7 +772,7 @@ int main(void)
                 if (my < 0) my = 0;
                 if (mx > W - 1) mx = W - 1;
                 if (my > H - 1) my = H - 1;
-                buttons = (pb2 & PAD_CROSS) ? 1 : 0;
+                buttons = ((pb2 & PAD_CROSS) ? 1 : 0) | ((pb2 & PAD_CIRCLE) ? 2 : 0);
                 if ((pb2 & PAD_START) && !(pad_prev & PAD_START)) menu_open = !menu_open;
                 pad_prev = pb2;
             } else buttons = 0;
@@ -675,6 +815,7 @@ int main(void)
                         else { drag = s; dox = mx - w->x; doy = my - w->y; }
                     } else if (w->app == 0) fm_click(w, mx, my, frame);
                     else if (w->app == 4) settings_click(w, mx, my);
+                    else if (w->app == 1) ms_click(w, mx, my, 0);
                     handled = 1;
                 }
             }
@@ -694,6 +835,15 @@ int main(void)
             if (w->y > H - TASKBAR_H - TITLE_H) w->y = H - TASKBAR_H - TITLE_H;
             if (w->x < -w->w + 40) w->x = -w->w + 40;
             if (w->x > W - 40) w->x = W - 40;
+        }
+        if ((buttons & 2) && !(prev & 2)) {   // right click / Circle: flag in Minesweeper
+            for (i = nopen - 1; i >= 0; i--) {
+                Win *w = &wins[order[i]];
+                if (mx >= w->x && mx < w->x + w->w && my >= w->y && my < w->y + w->h) {
+                    if (w->app == 1 && my >= w->y + TITLE_H) ms_click(w, mx, my, 1);
+                    break;
+                }
+            }
         }
         if (released) drag = -1;
         prev = buttons;
