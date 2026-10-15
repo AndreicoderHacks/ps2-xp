@@ -13,6 +13,7 @@
 #include <gsKit.h>
 #include <dmaKit.h>
 #include <libmouse.h>
+#include <libpad.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include "font.h"
@@ -28,6 +29,8 @@
 extern unsigned char usbd_irx[];     extern unsigned int size_usbd_irx;
 extern unsigned char ps2mouse_irx[]; extern unsigned int size_ps2mouse_irx;
 extern unsigned char ps2kbd_irx[];   extern unsigned int size_ps2kbd_irx;
+extern unsigned char sio2man_irx[];  extern unsigned int size_sio2man_irx;
+extern unsigned char padman_irx[];   extern unsigned int size_padman_irx;
 extern unsigned char iomanX_irx[];   extern unsigned int size_iomanX_irx;
 extern unsigned char fileXio_irx[];  extern unsigned int size_fileXio_irx;
 extern unsigned char bdm_irx[];      extern unsigned int size_bdm_irx;
@@ -37,12 +40,13 @@ extern unsigned char usbmass_bd_irx[];  extern unsigned int size_usbmass_bd_irx;
 #define RGB(r,g,b) GS_SETREG_RGBAQ(r,g,b,0x80,0)
 #define TASKBAR_H 30
 #define TITLE_H 22
-#define NAPPS 4
+#define NAPPS 5      // apps in Start menu (incl. Settings)
+#define NICONS 4     // apps with desktop icons
 #define MAXW 8
 
 static GSGLOBAL *gs;
 
-static const char *app_names[NAPPS] = {"My Computer", "Minesweeper", "Solitaire", "Media Player"};
+static const char *app_names[NAPPS] = {"My Computer", "Minesweeper", "Solitaire", "Media Player", "Settings"};
 
 typedef struct { int x, y, w, h, app, open; } Win;
 static Win wins[MAXW];
@@ -59,6 +63,8 @@ static void load_modules(void)
     SifInitRpc(0);
     sbv_patch_enable_lmb();
     sbv_patch_disable_prefix_check();
+    SifExecModuleBuffer(sio2man_irx, size_sio2man_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(padman_irx, size_padman_irx, 0, NULL, &ret);
     SifExecModuleBuffer(iomanX_irx, size_iomanX_irx, 0, NULL, &ret);
     SifExecModuleBuffer(fileXio_irx, size_fileXio_irx, 0, NULL, &ret);
     SifExecModuleBuffer(usbd_irx, size_usbd_irx, 0, NULL, &ret);
@@ -398,6 +404,82 @@ static void fm_click(Win *w, int mx, int my, int frame)
     }
 }
 
+/* ---------- input (controller / mouse) + Settings app + Start menu ---------- */
+static int input_mode = 0;       // 0 = controller (default at every startup), 1 = USB mouse
+static int pad_ok = 0, pad_mode_set = 0;
+static u32 mouse_en_g = 0;
+static unsigned short pad_prev = 0;
+static char pad_buf[256] __attribute__((aligned(64)));
+static int menu_open = 0;
+
+static int pad_poll(int *dx, int *dy, unsigned short *btns)
+{
+    struct padButtonStatus pb;
+    int st = padGetState(0, 0), sx = 0, sy = 0;
+    if (st != PAD_STATE_STABLE && st != PAD_STATE_FINDCTP1) { pad_ok = 0; return 0; }
+    if (!pad_mode_set) { padSetMainMode(0, 0, PAD_MMODE_DUALSHOCK, PAD_MMODE_LOCK); pad_mode_set = 1; }
+    if (padRead(0, 0, &pb) == 0) return 0;
+    pad_ok = 1;
+    *btns = 0xffff ^ pb.btns;
+    if ((pb.mode & 0xf0) == 0x70) {          // analog (DualShock) mode
+        int hx = (int)pb.ljoy_h - 128, vy = (int)pb.ljoy_v - 128;
+        if (abs(hx) > 24) sx = hx / 12;
+        if (abs(vy) > 24) sy = vy / 12;
+    }
+    if (*btns & PAD_LEFT)  sx -= 4;
+    if (*btns & PAD_RIGHT) sx += 4;
+    if (*btns & PAD_UP)    sy -= 4;
+    if (*btns & PAD_DOWN)  sy += 4;
+    *dx = sx; *dy = sy;
+    return 1;
+}
+
+static void draw_settings(Win *w)
+{
+    int x = w->x + 3, y = w->y + TITLE_H, i;
+    draw_text(x + 16, y + 14, "INPUT DEVICE", 20, 2, RGB(30, 30, 30));
+    for (i = 0; i < 2; i++) {
+        int ry = y + 50 + i * 30;
+        rect(x + 16, ry, x + 30, ry + 14, RGB(90, 90, 90));
+        rect(x + 17, ry + 1, x + 29, ry + 13, RGB(255, 255, 255));
+        if (input_mode == i) rect(x + 20, ry + 4, x + 26, ry + 10, RGB(0, 80, 220));
+        draw_text(x + 40, ry + 4, i == 0 ? "CONTROLLER (DEFAULT)" : "USB MOUSE", 24, 1, RGB(20, 20, 20));
+    }
+    draw_text(x + 16, y + 116, pad_ok ? "CONTROLLER: DETECTED" : "CONTROLLER: NOT FOUND", 24, 1, pad_ok ? RGB(0, 120, 0) : RGB(200, 30, 30));
+    draw_text(x + 16, y + 132, mouse_en_g ? "MOUSE: DETECTED" : "MOUSE: NOT FOUND", 24, 1, mouse_en_g ? RGB(0, 120, 0) : RGB(200, 30, 30));
+    draw_text(x + 16, y + 154, "X / D-PAD / STICK = CURSOR. START = MENU", 44, 1, RGB(90, 90, 90));
+}
+
+static void settings_click(Win *w, int mx, int my)
+{
+    int x = w->x + 3, y = w->y + TITLE_H, i;
+    for (i = 0; i < 2; i++) {
+        int ry = y + 50 + i * 30;
+        if (mx >= x + 16 && mx < x + 220 && my >= ry && my < ry + 16) {
+            if (i == 1 && !mouse_en_g) { set_status("NO MOUSE DETECTED"); return; }
+            input_mode = i;
+            set_status(i == 0 ? "INPUT: CONTROLLER" : "INPUT: USB MOUSE");
+        }
+    }
+}
+
+#define MENU_W 180
+#define MENU_ITEM_H 26
+static int menu_h(void) { return NAPPS * MENU_ITEM_H + 6; }
+
+static void draw_menu(int mx, int my)
+{
+    int H = gs->Height, i, x = 0, y = H - TASKBAR_H - menu_h();
+    rect(x, y, x + MENU_W, y + menu_h(), RGB(20, 60, 170));
+    rect(x + 2, y + 2, x + MENU_W - 2, y + menu_h() - 2, RGB(240, 240, 250));
+    for (i = 0; i < NAPPS; i++) {
+        int iy = y + 3 + i * MENU_ITEM_H;
+        int hov = (mx >= x && mx < x + MENU_W && my >= iy && my < iy + MENU_ITEM_H);
+        if (hov) rect(x + 3, iy, x + MENU_W - 3, iy + MENU_ITEM_H, RGB(50, 90, 200));
+        draw_text(x + 14, iy + 8, app_names[i], 20, 1, hov ? RGB(255, 255, 255) : RGB(20, 20, 20));
+    }
+}
+
 /* ---------- window manager ---------- */
 static int top_slot(void) { return nopen ? order[nopen - 1] : -1; }
 
@@ -452,6 +534,7 @@ static void draw_window(int slot, int active)
     // body
     rect(x + 3, y + TITLE_H, x + w->w - 3, y + w->h - 3, RGB(236, 233, 216));
     if (w->app == 0) draw_fm(w);
+    else if (w->app == 4) draw_settings(w);
     else draw_text(x + 20, y + 80, "COMING SOON", 20, 2, RGB(90, 90, 90));
 }
 
@@ -524,6 +607,8 @@ int main(void)
     load_modules();
     init_gs();
     PS2MouseInit();
+    padInit(0);
+    padPortOpen(0, 0, pad_buf);
 
     while (1) {
         int W = gs->Width, H = gs->Height;
@@ -537,7 +622,22 @@ int main(void)
                 configured = 1;
             }
         }
-        if (configured && PS2MouseRead(&md) >= 0) {
+        mouse_en_g = en;
+        if (input_mode == 0) {
+            int dx = 0, dy = 0;
+            unsigned short pb2 = 0;
+            if (pad_poll(&dx, &dy, &pb2)) {
+                mx += dx; my += dy;
+                if (mx < 0) mx = 0;
+                if (my < 0) my = 0;
+                if (mx > W - 1) mx = W - 1;
+                if (my > H - 1) my = H - 1;
+                buttons = (pb2 & PAD_CROSS) ? 1 : 0;
+                if ((pb2 & PAD_START) && !(pad_prev & PAD_START)) menu_open = !menu_open;
+                pad_prev = pb2;
+            } else buttons = 0;
+        }
+        if (input_mode == 1 && configured && PS2MouseRead(&md) >= 0) {
             mx = md.x; my = md.y; buttons = md.buttons;
             if (mx < 0) mx = 0;
             if (my < 0) my = 0;
@@ -550,7 +650,16 @@ int main(void)
 
         if (pressed) {
             int handled = 0;
-            if (my >= H - TASKBAR_H) {
+            if (menu_open) {
+                int mh = menu_h(), myp = H - TASKBAR_H - mh;
+                if (mx >= 0 && mx < MENU_W && my >= myp && my < myp + mh) {
+                    int it = (my - myp - 3) / MENU_ITEM_H;
+                    if (it >= 0 && it < NAPPS) open_app(it);
+                    menu_open = 0; handled = 1;
+                } else if (mx < 90 && my >= H - TASKBAR_H) { menu_open = 0; handled = 1; }
+                else menu_open = 0;
+            } else if (mx < 90 && my >= H - TASKBAR_H) { menu_open = 1; handled = 1; }
+            if (!handled && my >= H - TASKBAR_H) {
                 int s = taskbar_hit(mx);
                 if (s >= 0) focus(s);
                 handled = 1;
@@ -565,12 +674,13 @@ int main(void)
                             close_win(s);
                         else { drag = s; dox = mx - w->x; doy = my - w->y; }
                     } else if (w->app == 0) fm_click(w, mx, my, frame);
+                    else if (w->app == 4) settings_click(w, mx, my);
                     handled = 1;
                 }
             }
             if (!handled) {
                 int hit = -1;
-                for (i = 0; i < NAPPS; i++)
+                for (i = 0; i < NICONS; i++)
                     if (mx >= icon_x() - 8 && mx < icon_x() + 56 && my >= icon_y(i) - 4 && my < icon_y(i) + 76) hit = i;
                 if (hit >= 0 && hit == last_icon && frame - last_click < 30) { open_app(hit); last_icon = -1; }
                 else { last_icon = hit; last_click = frame; }
@@ -596,9 +706,10 @@ int main(void)
         } else {
             vgrad(0, 0, W, H - TASKBAR_H, 60, 110, 200, 160, 200, 250);
         }
-        for (i = 0; i < NAPPS; i++) draw_icon(i, i == sel_icon);
+        for (i = 0; i < NICONS; i++) draw_icon(i, i == sel_icon);
         for (i = 0; i < nopen; i++) draw_window(order[i], i == nopen - 1);
         draw_taskbar(top_slot());
+        if (menu_open) draw_menu(mx, my);
         if (frame < status_until) {
             int tw = strlen(status) * 6 + 12;
             rect(W / 2 - tw / 2, 6, W / 2 + tw / 2, 24, RGB(20, 20, 40));
