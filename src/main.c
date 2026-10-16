@@ -15,6 +15,9 @@
 #include <libmouse.h>
 #include <libpad.h>
 #include <audsrv.h>
+#include <libpwroff.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -34,6 +37,7 @@
 #include "minimp3.h"
 
 extern unsigned char usbd_irx[];     extern unsigned int size_usbd_irx;
+extern unsigned char poweroff_irx[]; extern unsigned int size_poweroff_irx;
 extern unsigned char libsd_irx[];    extern unsigned int size_libsd_irx;
 extern unsigned char audsrv_irx[];   extern unsigned int size_audsrv_irx;
 extern unsigned char ps2mouse_irx[]; extern unsigned int size_ps2mouse_irx;
@@ -49,13 +53,13 @@ extern unsigned char usbmass_bd_irx[];  extern unsigned int size_usbmass_bd_irx;
 #define RGB(r,g,b) GS_SETREG_RGBAQ(r,g,b,0x80,0)
 #define TASKBAR_H 30
 #define TITLE_H 22
-#define NAPPS 5      // apps in Start menu (incl. Settings)
-#define NICONS 4     // apps with desktop icons
+#define NAPPS 6      // apps in Start menu (incl. Settings, Video Player)
+#define NICONS 5     // desktop icons (4 apps + Recycle Bin)
 #define MAXW 8
 
 static GSGLOBAL *gs;
 
-static const char *app_names[NAPPS] = {"My Computer", "Minesweeper", "Solitaire", "Media Player", "Settings"};
+static const char *app_names[NAPPS] = {"My Computer", "Minesweeper", "Solitaire", "Media Player", "Settings", "Video Player"};
 
 typedef struct { int x, y, w, h, app, open; } Win;
 static Win wins[MAXW];
@@ -80,6 +84,7 @@ static void load_modules(void)
     SifExecModuleBuffer(bdm_irx, size_bdm_irx, 0, NULL, &ret);
     SifExecModuleBuffer(bdmfs_fatfs_irx, size_bdmfs_fatfs_irx, 0, NULL, &ret);
     SifExecModuleBuffer(usbmass_bd_irx, size_usbmass_bd_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(poweroff_irx, size_poweroff_irx, 0, NULL, &ret);
     SifExecModuleBuffer(libsd_irx, size_libsd_irx, 0, NULL, &ret);
     SifExecModuleBuffer(audsrv_irx, size_audsrv_irx, 0, NULL, &ret);
     SifExecModuleBuffer(ps2mouse_irx, size_ps2mouse_irx, 0, NULL, &ret);
@@ -256,6 +261,46 @@ static int is_mp3(const char *n)
 static void mp_open_from_fm(int idx);
 static void open_app(int app);
 
+/* ---------- global settings + persistent ini ---------- */
+static int g_vol = 80, stick_dz = 40, cursor_speed = 5;
+static int audsrv_ok = 0, sleeping = 0;
+static int icon_px[NICONS], icon_py[NICONS];
+static int ini_loaded = 0;
+#define INI_PATH "mass:/ps2xp.ini"
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static void ini_save(void)
+{
+    FILE *f = fopen(INI_PATH, "w");
+    int i;
+    if (!f) return;
+    fprintf(f, "vol=%d\ndz=%d\nspeed=%d\n", g_vol, stick_dz, cursor_speed);
+    for (i = 0; i < NICONS; i++) fprintf(f, "icon%d=%d,%d\n", i, icon_px[i], icon_py[i]);
+    fclose(f);
+}
+
+static void ini_load(void)
+{
+    FILE *f = fopen(INI_PATH, "r");
+    char line[64];
+    int a, b, i;
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "vol=%d", &a) == 1) g_vol = clampi(a, 0, 100);
+        else if (sscanf(line, "dz=%d", &a) == 1) stick_dz = clampi(a, 10, 100);
+        else if (sscanf(line, "speed=%d", &a) == 1) cursor_speed = clampi(a, 1, 10);
+        else if (sscanf(line, "icon%d=%d,%d", &i, &a, &b) == 3 && i >= 0 && i < NICONS) {
+            icon_px[i] = clampi(a, 0, 560); icon_py[i] = clampi(b, 0, 380);
+        }
+    }
+    fclose(f);
+    ini_loaded = 1;
+    if (audsrv_ok) audsrv_set_volume(g_vol);
+}
+
+static int path_exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
+
 /* ---------- file manager (My Computer) ---------- */
 #define FM_MAX 256
 typedef struct { char name[100]; int dir; unsigned int size; } FMEntry;
@@ -372,18 +417,115 @@ static void fm_enter(int idx)
     if (fm_load(fm.path) < 0) { strcpy(fm.path, old); fm_load(fm.path); }
 }
 
-static const int fm_bx[5] = {6, 48, 104, 136, 168};
-static const int fm_bw[5] = {36, 50, 28, 28, 52};
-static const char *fm_bl[5] = {"UP", "REFR", "^", "V", "NOWP"};
+#define FM_NB 8
+static const int fm_bx[FM_NB] = {6, 48, 104, 136, 168, 226, 284, 324};
+static const int fm_bw[FM_NB] = {36, 50, 28, 28, 52, 52, 36, 44};
+static const char *fm_bl[FM_NB] = {"UP", "REFR", "^", "V", "NOWP", "MKDIR", "DEL", "REST"};
+static int sb_drag = 0, sb_slot = 0;
+static int del_idx = -1, del_frame = -1000;
 
 static int fm_vis(Win *w) { return (w->h - TITLE_H - 38 - 6) / 14; }
+
+static int fm_in_bin(void) { return strncasecmp(fm.path, "mass:/RECYCLE/", 14) == 0; }
+
+static void fm_scroll_by(Win *w, int d)
+{
+    int mx_s = fm.count - fm_vis(w);
+    fm.scroll += d;
+    if (fm.scroll > mx_s) fm.scroll = mx_s;
+    if (fm.scroll < 0) fm.scroll = 0;
+}
+
+static void fm_sb_set(Win *w, int my)
+{
+    int vis = fm_vis(w), total = fm.count;
+    int top = w->y + TITLE_H + 38, trackh = (w->y + w->h - 6) - top;
+    int thumbh, range, pos;
+    if (total <= vis) { fm.scroll = 0; return; }
+    thumbh = trackh * vis / total; if (thumbh < 16) thumbh = 16;
+    range = trackh - thumbh;
+    if (range < 1) return;
+    pos = my - top - thumbh / 2;
+    fm.scroll = clampi(pos * (total - vis) / range, 0, total - vis);
+}
+
+static int move_to(const char *src, const char *name, const char *dstdir)
+{
+    char d[400];
+    int i;
+    snprintf(d, sizeof(d), "%s%s", dstdir, name);
+    for (i = 2; path_exists(d) && i < 100; i++) snprintf(d, sizeof(d), "%s%d_%s", dstdir, i, name);
+    return rename(src, d);
+}
+
+static void fm_mkdir(void)
+{
+    char p[300];
+    int i;
+    if (fm.demo) { set_status("NO USB - CANT CREATE FOLDER"); return; }
+    for (i = 1; i < 100; i++) {
+        if (i == 1) snprintf(p, sizeof(p), "%sNEW FOLDER", fm.path);
+        else snprintf(p, sizeof(p), "%sNEW FOLDER %d", fm.path, i);
+        if (!path_exists(p)) break;
+    }
+    if (mkdir(p, 0777) == 0) {
+        const char *nm = strrchr(p, '/') + 1;
+        set_status("FOLDER CREATED");
+        fm_load(fm.path);
+        for (i = 0; i < fm.count; i++) if (!strcmp(fm.e[i].name, nm)) { fm.sel = i; if (i >= fm.scroll + 12) fm.scroll = i - 6; }
+    } else set_status("CANT CREATE FOLDER");
+}
+
+static void fm_del(void)
+{
+    char p[400];
+    int idx = fm.sel, r;
+    if (fm.demo) { set_status("NO USB"); return; }
+    if (idx < 0 || idx >= fm.count || !strcmp(fm.e[idx].name, "..")) { set_status("SELECT A FILE OR FOLDER FIRST"); return; }
+    snprintf(p, sizeof(p), "%s%s", fm.path, fm.e[idx].name);
+    if (fm_in_bin()) {
+        if (!(del_idx == idx && g_frame - del_frame < 250)) {
+            del_idx = idx; del_frame = g_frame;
+            set_status("PRESS DEL AGAIN TO DELETE FOREVER");
+            return;
+        }
+        r = fm.e[idx].dir ? rmdir(p) : remove(p);
+        set_status(r == 0 ? "DELETED PERMANENTLY" : "CANT DELETE (FOLDER NOT EMPTY?)");
+    } else {
+        mkdir("mass:/RECYCLE", 0777);
+        if (move_to(p, fm.e[idx].name, "mass:/RECYCLE/") == 0) set_status("MOVED TO RECYCLE BIN");
+        else set_status("CANT MOVE TO RECYCLE BIN");
+    }
+    fm_load(fm.path);
+}
+
+static void fm_restore(void)
+{
+    char p[400];
+    int idx = fm.sel;
+    if (fm.demo) { set_status("NO USB"); return; }
+    if (!fm_in_bin()) { set_status("OPEN THE RECYCLE BIN TO RESTORE"); return; }
+    if (idx < 0 || idx >= fm.count || !strcmp(fm.e[idx].name, "..")) { set_status("SELECT AN ITEM FIRST"); return; }
+    snprintf(p, sizeof(p), "%s%s", fm.path, fm.e[idx].name);
+    if (move_to(p, fm.e[idx].name, "mass:/") == 0) set_status("RESTORED TO MAIN FOLDER");
+    else set_status("CANT RESTORE");
+    fm_load(fm.path);
+}
+
+static void open_recycle(void)
+{
+    mkdir("mass:/RECYCLE", 0777);
+    strcpy(fm.path, "mass:/RECYCLE/");
+    open_app(0);
+    fm_refresh();
+}
 
 static void draw_fm(Win *w)
 {
     int i, r, vis = fm_vis(w);
     int bx = w->x + 3, by = w->y + TITLE_H;
     char buf[32];
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < FM_NB; i++) {
         rect(bx + fm_bx[i], by + 4, bx + fm_bx[i] + fm_bw[i], by + 20, RGB(180, 180, 190));
         rect(bx + fm_bx[i] + 1, by + 5, bx + fm_bx[i] + fm_bw[i] - 1, by + 19, RGB(225, 225, 232));
         draw_text(bx + fm_bx[i] + 6, by + 9, fm_bl[i], 5, 1, RGB(30, 30, 30));
@@ -397,10 +539,22 @@ static void draw_fm(Win *w)
         if (idx == fm.sel) rect(bx + 4, ry - 2, w->x + w->w - 7, ry + 11, RGB(50, 90, 200));
         u64 tc = (idx == fm.sel) ? RGB(255, 255, 255) : RGB(20, 20, 20);
         rect(bx + 8, ry, bx + 18, ry + 9, fm.e[idx].dir ? RGB(240, 200, 60) : RGB(150, 160, 190));
-        draw_text(bx + 24, ry + 1, fm.e[idx].name, 24, 1, tc);
+        draw_text(bx + 24, ry + 1, fm.e[idx].name, 40, 1, tc);
         if (!fm.e[idx].dir) {
             snprintf(buf, sizeof(buf), "%u KB", (fm.e[idx].size + 1023) / 1024);
-            draw_text(w->x + w->w - 80, ry + 1, buf, 12, 1, tc);
+            draw_text(w->x + w->w - 100, ry + 1, buf, 12, 1, tc);
+        }
+    }
+    // scrollbar
+    {
+        int top = by + 38, bot = w->y + w->h - 6, sx = w->x + w->w - 20;
+        rect(sx, top, sx + 12, bot, RGB(225, 225, 232));
+        if (fm.count > vis) {
+            int trackh = bot - top, thumbh = trackh * vis / fm.count, ty;
+            if (thumbh < 16) thumbh = 16;
+            ty = top + (trackh - thumbh) * fm.scroll / (fm.count - vis);
+            rect(sx, ty, sx + 12, ty + thumbh, RGB(80, 110, 200));
+            rect(sx + 1, ty + 1, sx + 11, ty + thumbh - 1, RGB(130, 160, 235));
         }
     }
 }
@@ -408,17 +562,25 @@ static void draw_fm(Win *w)
 static void fm_click(Win *w, int mx, int my, int frame)
 {
     int i, bx = w->x + 3, by = w->y + TITLE_H, vis = fm_vis(w);
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < FM_NB; i++) {
         if (mx >= bx + fm_bx[i] && mx < bx + fm_bx[i] + fm_bw[i] && my >= by + 4 && my < by + 20) {
             if (i == 0) fm_up();
             else if (i == 1) fm_refresh();
-            else if (i == 2) { if (fm.scroll > 0) fm.scroll -= 3; if (fm.scroll < 0) fm.scroll = 0; }
+            else if (i == 2) fm_scroll_by(w, -3);
             else if (i == 4) wp_clear();
-            else { if (fm.scroll + vis < fm.count) fm.scroll += 3; }
+            else if (i == 5) fm_mkdir();
+            else if (i == 6) fm_del();
+            else if (i == 7) fm_restore();
+            else fm_scroll_by(w, 3);
             return;
         }
     }
-    if (my >= by + 38 && mx >= bx + 3 && mx < w->x + w->w - 6) {
+    if (my >= by + 38 && mx >= w->x + w->w - 20 && mx < w->x + w->w - 8) {   // scrollbar
+        sb_drag = 1; sb_slot = (int)(w - wins);
+        fm_sb_set(w, my);
+        return;
+    }
+    if (my >= by + 38 && mx >= bx + 3 && mx < w->x + w->w - 22) {
         int row = (my - (by + 38)) / 14, idx = fm.scroll + row;
         if (row < vis && idx < fm.count) {
             if (idx == fm.last_row && frame - fm.last_frame < 30) { fm_enter(idx); fm.last_row = -1; }
@@ -431,11 +593,9 @@ static void fm_click(Win *w, int mx, int my, int frame)
 static int input_mode = 0;       // 0 = controller (default at every startup), 1 = USB mouse
 static int pad_ok = 0, pad_mode_set = 0;
 static u32 mouse_en_g = 0;
-static unsigned short pad_prev = 0;
+static unsigned short pad_prev = 0, pad_last = 0;
 static char pad_buf[256] __attribute__((aligned(64)));
 static int menu_open = 0;
-
-#define STICK_DZ 40   // dead zone for stick drift (0-127); raise if the cursor still drifts
 
 static int pad_poll(int *dx, int *dy, unsigned short *btns)
 {
@@ -448,61 +608,109 @@ static int pad_poll(int *dx, int *dy, unsigned short *btns)
     *btns = 0xffff ^ pb.btns;
     if ((pb.mode & 0xf0) == 0x70) {          // analog (DualShock) mode
         int hx = (int)pb.ljoy_h - 128, vy = (int)pb.ljoy_v - 128;
-        if (abs(hx) > STICK_DZ) sx = (hx > 0 ? hx - STICK_DZ : hx + STICK_DZ) / 8;
-        if (abs(vy) > STICK_DZ) sy = (vy > 0 ? vy - STICK_DZ : vy + STICK_DZ) / 8;
+        if (abs(hx) > stick_dz) sx = (hx > 0 ? hx - stick_dz : hx + stick_dz) * cursor_speed / 40;
+        if (abs(vy) > stick_dz) sy = (vy > 0 ? vy - stick_dz : vy + stick_dz) * cursor_speed / 40;
     }
-    if (*btns & PAD_LEFT)  sx -= 4;
-    if (*btns & PAD_RIGHT) sx += 4;
-    if (*btns & PAD_UP)    sy -= 4;
-    if (*btns & PAD_DOWN)  sy += 4;
+    {
+        int ds = 1 + cursor_speed * 3 / 5;
+        if (*btns & PAD_LEFT)  sx -= ds;
+        if (*btns & PAD_RIGHT) sx += ds;
+        if (*btns & PAD_UP)    sy -= ds;
+        if (*btns & PAD_DOWN)  sy += ds;
+    }
     *dx = sx; *dy = sy;
     return 1;
+}
+
+static void draw_stepper(int x, int y, const char *label, int val)
+{
+    char b[12];
+    draw_text(x + 16, y + 5, label, 20, 1, RGB(20, 20, 20));
+    rect(x + 190, y, x + 212, y + 16, RGB(150, 150, 165)); rect(x + 191, y + 1, x + 211, y + 15, RGB(228, 228, 236));
+    draw_text(x + 198, y + 5, "-", 1, 1, RGB(20, 20, 20));
+    snprintf(b, sizeof(b), "%d", val);
+    draw_text(x + 222, y + 5, b, 4, 1, RGB(0, 60, 160));
+    rect(x + 256, y, x + 278, y + 16, RGB(150, 150, 165)); rect(x + 257, y + 1, x + 277, y + 15, RGB(228, 228, 236));
+    draw_text(x + 264, y + 5, "+", 1, 1, RGB(20, 20, 20));
+}
+
+static int stepper_hit(int x, int y, int mx, int my)
+{
+    if (my < y || my >= y + 16) return 0;
+    if (mx >= x + 190 && mx < x + 212) return -1;
+    if (mx >= x + 256 && mx < x + 278) return 1;
+    return 0;
 }
 
 static void draw_settings(Win *w)
 {
     int x = w->x + 3, y = w->y + TITLE_H, i;
-    draw_text(x + 16, y + 14, "INPUT DEVICE", 20, 2, RGB(30, 30, 30));
+    draw_text(x + 16, y + 10, "INPUT DEVICE", 20, 2, RGB(30, 30, 30));
     for (i = 0; i < 2; i++) {
-        int ry = y + 50 + i * 30;
+        int ry = y + 34 + i * 22;
         rect(x + 16, ry, x + 30, ry + 14, RGB(90, 90, 90));
         rect(x + 17, ry + 1, x + 29, ry + 13, RGB(255, 255, 255));
         if (input_mode == i) rect(x + 20, ry + 4, x + 26, ry + 10, RGB(0, 80, 220));
         draw_text(x + 40, ry + 4, i == 0 ? "CONTROLLER (DEFAULT)" : "USB MOUSE", 24, 1, RGB(20, 20, 20));
     }
-    draw_text(x + 16, y + 116, pad_ok ? "CONTROLLER: DETECTED" : "CONTROLLER: NOT FOUND", 24, 1, pad_ok ? RGB(0, 120, 0) : RGB(200, 30, 30));
-    draw_text(x + 16, y + 132, mouse_en_g ? "MOUSE: DETECTED" : "MOUSE: NOT FOUND", 24, 1, mouse_en_g ? RGB(0, 120, 0) : RGB(200, 30, 30));
-    draw_text(x + 16, y + 154, "X / D-PAD / STICK = CURSOR. START = MENU", 44, 1, RGB(90, 90, 90));
+    draw_text(x + 16, y + 82, pad_ok ? "CONTROLLER: DETECTED" : "CONTROLLER: NOT FOUND", 24, 1, pad_ok ? RGB(0, 120, 0) : RGB(200, 30, 30));
+    draw_text(x + 16, y + 96, mouse_en_g ? "MOUSE: DETECTED" : "MOUSE: NOT FOUND", 24, 1, mouse_en_g ? RGB(0, 120, 0) : RGB(200, 30, 30));
+    draw_stepper(x, y + 124, "VOLUME", g_vol);
+    draw_stepper(x, y + 150, "STICK DEAD ZONE", stick_dz);
+    draw_stepper(x, y + 176, "CURSOR SPEED", cursor_speed);
+    draw_text(x + 16, y + 206, "X = CLICK, CIRCLE = RIGHT CLICK", 40, 1, RGB(90, 90, 90));
+    draw_text(x + 16, y + 220, "START = MENU, L1/R1 = SCROLL", 40, 1, RGB(90, 90, 90));
 }
 
 static void settings_click(Win *w, int mx, int my)
 {
-    int x = w->x + 3, y = w->y + TITLE_H, i;
+    int x = w->x + 3, y = w->y + TITLE_H, i, d;
     for (i = 0; i < 2; i++) {
-        int ry = y + 50 + i * 30;
+        int ry = y + 34 + i * 22;
         if (mx >= x + 16 && mx < x + 220 && my >= ry && my < ry + 16) {
             if (i == 1 && !mouse_en_g) { set_status("NO MOUSE DETECTED"); return; }
             input_mode = i;
             set_status(i == 0 ? "INPUT: CONTROLLER" : "INPUT: USB MOUSE");
         }
     }
+    if ((d = stepper_hit(x, y + 124, mx, my))) {
+        g_vol = clampi(g_vol + d * 10, 0, 100);
+        if (audsrv_ok) audsrv_set_volume(g_vol);
+        ini_save();
+    } else if ((d = stepper_hit(x, y + 150, mx, my))) { stick_dz = clampi(stick_dz + d * 5, 10, 100); ini_save(); }
+    else if ((d = stepper_hit(x, y + 176, mx, my))) { cursor_speed = clampi(cursor_speed + d, 1, 10); ini_save(); }
 }
 
-#define MENU_W 180
+#define MENU_W 190
 #define MENU_ITEM_H 26
-static int menu_h(void) { return NAPPS * MENU_ITEM_H + 6; }
+#define MENU_NPOWER 3
+static const char *power_names[MENU_NPOWER] = {"Restart", "Sleep", "Power Off"};
+static int menu_h(void) { return (NAPPS + MENU_NPOWER) * MENU_ITEM_H + 10; }
+
+static int menu_item_at(int my, int myp)
+{
+    int rel = my - myp - 3, k;
+    if (rel < 0) return -1;
+    if (rel < NAPPS * MENU_ITEM_H) return rel / MENU_ITEM_H;
+    rel -= NAPPS * MENU_ITEM_H + 4;
+    if (rel < 0) return -1;
+    k = rel / MENU_ITEM_H;
+    return k < MENU_NPOWER ? NAPPS + k : -1;
+}
 
 static void draw_menu(int mx, int my)
 {
     int H = gs->Height, i, x = 0, y = H - TASKBAR_H - menu_h();
+    int hv = (mx >= x && mx < x + MENU_W) ? menu_item_at(my, y) : -1;
     rect(x, y, x + MENU_W, y + menu_h(), RGB(20, 60, 170));
     rect(x + 2, y + 2, x + MENU_W - 2, y + menu_h() - 2, RGB(240, 240, 250));
-    for (i = 0; i < NAPPS; i++) {
-        int iy = y + 3 + i * MENU_ITEM_H;
-        int hov = (mx >= x && mx < x + MENU_W && my >= iy && my < iy + MENU_ITEM_H);
-        if (hov) rect(x + 3, iy, x + MENU_W - 3, iy + MENU_ITEM_H, RGB(50, 90, 200));
-        draw_text(x + 14, iy + 8, app_names[i], 20, 1, hov ? RGB(255, 255, 255) : RGB(20, 20, 20));
+    for (i = 0; i < NAPPS + MENU_NPOWER; i++) {
+        int iy = y + 3 + i * MENU_ITEM_H + (i >= NAPPS ? 4 : 0);
+        const char *nm = i < NAPPS ? app_names[i] : power_names[i - NAPPS];
+        if (i == hv) rect(x + 3, iy, x + MENU_W - 3, iy + MENU_ITEM_H, RGB(50, 90, 200));
+        draw_text(x + 14, iy + 8, nm, 20, 1, i == hv ? RGB(255, 255, 255) : RGB(20, 20, 20));
     }
+    rect(x + 8, y + 3 + NAPPS * MENU_ITEM_H + 1, x + MENU_W - 8, y + 3 + NAPPS * MENU_ITEM_H + 3, RGB(170, 175, 200));
 }
 
 /* ---------- Minesweeper (9x9, 10 mines) ---------- */
@@ -887,7 +1095,6 @@ static void draw_sol(Win *w)
 #define FFT_N 512
 #define FFT_LOG 9
 #define NBARS 24
-static int audsrv_ok = 0;
 static struct {
     char dir[256];
     char names[MP_MAX][100];
@@ -895,7 +1102,7 @@ static struct {
     unsigned char *buf;
     long size, pos;
     mp3dec_t dec;
-    int hz, kbps, vol, demo;
+    int hz, kbps, demo;
     unsigned int played, tone_n;
     float tone_ph;
     short vis[FFT_N];
@@ -914,8 +1121,7 @@ static void mp_init(void)
         if (e <= prev && i > 0) e = prev + 1;
         bar_edge[i] = e; prev = e;
     }
-    mp.vol = 80;
-    if (audsrv_ok) audsrv_set_volume(mp.vol);
+    if (audsrv_ok) audsrv_set_volume(g_vol);
 }
 
 static void mp_stop(void)
@@ -1116,7 +1322,7 @@ static void draw_mp(Win *w)
     // volume
     draw_text(bx + 190, by + 176, "VOL", 3, 1, white);
     rect(bx + 220, by + 168, bx + 246, by + 192, RGB(225, 228, 240)); draw_text(bx + 230, by + 176, "-", 1, 1, RGB(20, 20, 20));
-    snprintf(buf, sizeof(buf), "%d", mp.vol);
+    snprintf(buf, sizeof(buf), "%d", g_vol);
     draw_text(bx + 254, by + 176, buf, 3, 1, white);
     rect(bx + 286, by + 168, bx + 312, by + 192, RGB(225, 228, 240)); draw_text(bx + 296, by + 176, "+", 1, 1, RGB(20, 20, 20));
     // playlist
@@ -1149,8 +1355,8 @@ static void mp_click(Win *w, int mx, int my, int frame)
                 return;
             }
         }
-        if (mx >= bx + 220 && mx < bx + 246) { mp.vol = mp.vol > 10 ? mp.vol - 10 : 0; if (audsrv_ok) audsrv_set_volume(mp.vol); }
-        if (mx >= bx + 286 && mx < bx + 312) { mp.vol = mp.vol < 90 ? mp.vol + 10 : 100; if (audsrv_ok) audsrv_set_volume(mp.vol); }
+        if (mx >= bx + 220 && mx < bx + 246) { g_vol = g_vol > 10 ? g_vol - 10 : 0; if (audsrv_ok) audsrv_set_volume(g_vol); }
+        if (mx >= bx + 286 && mx < bx + 312) { g_vol = g_vol < 90 ? g_vol + 10 : 100; if (audsrv_ok) audsrv_set_volume(g_vol); }
         return;
     }
     if (my >= by + 202 && my < by + 296 && mx >= bx + 8 && mx < bx + 352) {
@@ -1189,8 +1395,8 @@ static void open_app(int app)
     if (slot < 0) return;
     wins[slot].open = 1;
     wins[slot].app = app;
-    wins[slot].w = (app == 0) ? 380 : (app == 1) ? 198 : (app == 2) ? 312 : (app == 3) ? 360 : 300;
-    wins[slot].h = (app == 0) ? 290 : (app == 1) ? 250 : (app == 2) ? 360 : (app == 3) ? 326 : 200;
+    wins[slot].w = (app == 0) ? 400 : (app == 1) ? 198 : (app == 2) ? 312 : (app == 3) ? 360 : (app == 4) ? 320 : 300;
+    wins[slot].h = (app == 0) ? 330 : (app == 1) ? 250 : (app == 2) ? 360 : (app == 3) ? 326 : (app == 4) ? 262 : 200;
     wins[slot].x = 110 + (nopen % 6) * 28;
     wins[slot].y = 20 + (nopen % 6) * 28;
     order[nopen++] = slot;
@@ -1223,8 +1429,8 @@ static void draw_window(int slot, int active)
 }
 
 /* ---------- desktop ---------- */
-static int icon_x(void) { return 24; }
-static int icon_y(int i) { return 20 + i * 84; }
+static int icon_x(int i) { return icon_px[i]; }
+static int icon_y(int i) { return icon_py[i]; }
 
 static int isqrt_i(int n) { int r = 0; while ((r + 1) * (r + 1) <= n) r++; return r; }
 
@@ -1299,14 +1505,28 @@ static void draw_app_icon(int app, int x, int y)
     }
 }
 
+static void draw_bin_icon(int x, int y)
+{
+    rect(x + 9, y + 9, x + 39, y + 14, RGB(70, 75, 85));                 // lid
+    rect(x + 18, y + 5, x + 30, y + 9, RGB(70, 75, 85));                 // handle
+    rect(x + 11, y + 14, x + 37, y + 43, RGB(70, 75, 85));               // body outline
+    rect(x + 12, y + 14, x + 36, y + 42, RGB(190, 198, 210));
+    rect(x + 12, y + 14, x + 17, y + 42, RGB(225, 230, 240));            // highlight
+    rect(x + 18, y + 17, x + 20, y + 39, RGB(110, 118, 135));            // ridges
+    rect(x + 23, y + 17, x + 25, y + 39, RGB(110, 118, 135));
+    rect(x + 28, y + 17, x + 30, y + 39, RGB(110, 118, 135));
+    rect(x + 12, y + 38, x + 36, y + 42, RGB(60, 150, 70));              // green recycle band
+}
+
 static void draw_icon(int i, int selected)
 {
-    int x = icon_x(), y = icon_y(i);
-    int len = strlen(app_names[i]), tx = x + 24 - len * 3;
+    int x = icon_x(i), y = icon_y(i);
+    const char *nm = (i < 4) ? app_names[i] : "Recycle Bin";
+    int len = strlen(nm), tx = x + 24 - len * 3;
     if (selected) rect(x - 16, y - 4, x + 64, y + 68, RGB(50, 90, 200));
-    draw_app_icon(i, x, y);
-    draw_text(tx + 1, y + 55, app_names[i], 14, 1, RGB(0, 0, 0));      // shadow
-    draw_text(tx, y + 54, app_names[i], 14, 1, RGB(255, 255, 255));
+    if (i < 4) draw_app_icon(i, x, y); else draw_bin_icon(x, y);
+    draw_text(tx + 1, y + 55, nm, 14, 1, RGB(0, 0, 0));      // shadow
+    draw_text(tx, y + 54, nm, 14, 1, RGB(255, 255, 255));
 }
 
 static void draw_taskbar(int top)
@@ -1352,6 +1572,29 @@ static void draw_debug(u32 en, u32 buttons)
         rect(W - 68 + i * 18, H - 24, W - 54 + i * 18, H - 6, (buttons & (1 << i)) ? RGB(255, 255, 0) : RGB(30, 30, 60));
 }
 
+
+static void scroll_top_window(int dir)
+{
+    int t = top_slot();
+    if (t < 0) return;
+    if (wins[t].app == 0) fm_scroll_by(&wins[t], dir * (fm_vis(&wins[t]) - 1));
+    else if (wins[t].app == 3) { mp.scroll = clampi(mp.scroll + dir * 5, 0, mp.n > 6 ? mp.n - 6 : 0); }
+}
+
+static void power_action(int a)
+{
+    if (a == 0) {                       // Restart: leave to the console browser
+        if (audsrv_ok) audsrv_quit();
+        Exit(0);
+    } else if (a == 1) {                // Sleep: black screen until a button is pressed
+        sleeping = 1;
+        if (mp.state == 1) mp.state = 2;
+    } else {                            // Power off
+        if (audsrv_ok) audsrv_stop_audio();
+        poweroffShutdown();
+    }
+}
+
 /* ---------- main ---------- */
 int main(void)
 {
@@ -1360,13 +1603,16 @@ int main(void)
     u32 en = 0, buttons = 0, prev = 0;
     int drag = -1, dox = 0, doy = 0;
     int sel_icon = -1, last_icon = -1, last_click = -1000;
+    int icon_drag = -1, icon_dox = 0, icon_doy = 0, icon_moved = 0, icon_sx = 0, icon_sy = 0;
 
     load_modules();
     init_gs();
+    for (i = 0; i < NICONS; i++) { icon_px[i] = 24; icon_py[i] = 12 + i * 80; }
     PS2MouseInit();
     padInit(0);
     padPortOpen(0, 0, pad_buf);
     audsrv_ok = (audsrv_init() == 0);
+    poweroffInit();
     mp_init();
 
     while (1) {
@@ -1392,9 +1638,12 @@ int main(void)
                 if (mx > W - 1) mx = W - 1;
                 if (my > H - 1) my = H - 1;
                 buttons = ((pb2 & PAD_CROSS) ? 1 : 0) | ((pb2 & PAD_CIRCLE) ? 2 : 0);
+                if ((pb2 & PAD_R1) && !(pad_prev & PAD_R1)) scroll_top_window(1);
+                if ((pb2 & PAD_L1) && !(pad_prev & PAD_L1)) scroll_top_window(-1);
+                pad_last = pb2;
                 if ((pb2 & PAD_START) && !(pad_prev & PAD_START)) menu_open = !menu_open;
                 pad_prev = pb2;
-            } else buttons = 0;
+            } else { buttons = 0; pad_last = 0; }
         }
         if (input_mode == 1 && configured && PS2MouseRead(&md) >= 0) {
             mx = md.x; my = md.y; buttons = md.buttons;
@@ -1404,6 +1653,16 @@ int main(void)
             if (my > H - 1) my = H - 1;
         }
 
+        if (sleeping) {
+            if (pad_last || buttons) { sleeping = 0; prev = buttons | 1; pad_prev = pad_last; }
+            else {
+                rect(0, 0, W, H, RGB(0, 0, 0));
+                gsKit_queue_exec(gs);
+                gsKit_sync_flip(gs);
+                frame++;
+                continue;
+            }
+        }
         int pressed = (buttons & 1) && !(prev & 1);
         int released = !(buttons & 1) && (prev & 1);
 
@@ -1412,9 +1671,10 @@ int main(void)
             if (menu_open) {
                 int mh = menu_h(), myp = H - TASKBAR_H - mh;
                 if (mx >= 0 && mx < MENU_W && my >= myp && my < myp + mh) {
-                    int it = (my - myp - 3) / MENU_ITEM_H;
-                    if (it >= 0 && it < NAPPS) open_app(it);
+                    int it = menu_item_at(my, myp);
                     menu_open = 0; handled = 1;
+                    if (it >= 0 && it < NAPPS) open_app(it);
+                    else if (it >= NAPPS) power_action(it - NAPPS);
                 } else if (mx < 90 && my >= H - TASKBAR_H) { menu_open = 0; handled = 1; }
                 else menu_open = 0;
             } else if (mx < 90 && my >= H - TASKBAR_H) { menu_open = 1; handled = 1; }
@@ -1443,10 +1703,11 @@ int main(void)
             if (!handled) {
                 int hit = -1;
                 for (i = 0; i < NICONS; i++)
-                    if (mx >= icon_x() - 16 && mx < icon_x() + 64 && my >= icon_y(i) - 4 && my < icon_y(i) + 68) hit = i;
-                if (hit >= 0 && hit == last_icon && frame - last_click < 30) { open_app(hit); last_icon = -1; }
+                    if (mx >= icon_x(i) - 16 && mx < icon_x(i) + 64 && my >= icon_y(i) - 4 && my < icon_y(i) + 68) hit = i;
+                if (hit >= 0 && hit == last_icon && frame - last_click < 30) { if (hit < 4) open_app(hit); else open_recycle(); last_icon = -1; }
                 else { last_icon = hit; last_click = frame; }
                 sel_icon = hit;
+                if (hit >= 0 && last_icon == hit) { icon_drag = hit; icon_dox = mx - icon_px[hit]; icon_doy = my - icon_py[hit]; icon_moved = 0; icon_sx = mx; icon_sy = my; }
             }
         }
         if (drag >= 0 && (buttons & 1)) {
@@ -1467,7 +1728,22 @@ int main(void)
                 }
             }
         }
-        if (released) drag = -1;
+        if (icon_drag >= 0 && (buttons & 1)) {
+            if (!icon_moved && (abs(mx - icon_sx) > 4 || abs(my - icon_sy) > 4)) icon_moved = 1;
+            if (icon_moved) {
+                icon_px[icon_drag] = clampi(mx - icon_dox, 0, W - 80);
+                icon_py[icon_drag] = clampi(my - icon_doy, 0, H - TASKBAR_H - 70);
+            }
+        }
+        if (sb_drag) {
+            if ((buttons & 1) && wins[sb_slot].open && wins[sb_slot].app == 0) fm_sb_set(&wins[sb_slot], my);
+            else sb_drag = 0;
+        }
+        if (released) {
+            drag = -1;
+            if (icon_drag >= 0) { if (icon_moved) { last_icon = -1; ini_save(); } icon_drag = -1; }
+            sb_drag = 0;
+        }
         prev = buttons;
 
         mp_pump();
@@ -1476,6 +1752,7 @@ int main(void)
         // ----- draw -----
         g_frame = frame;
         if (frame == 300 || frame == 900) wp_try_cfg();
+        if ((frame == 300 || frame == 900) && !ini_loaded) ini_load();
         if (wp_ready) {
             gsKit_prim_sprite_texture(gs, &wp_tex, 0, 0, 0, 0, W, H - TASKBAR_H, WP_W, WP_H, 1, GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0));
         } else {
