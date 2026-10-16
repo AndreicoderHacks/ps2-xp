@@ -14,6 +14,8 @@
 #include <dmaKit.h>
 #include <libmouse.h>
 #include <libpad.h>
+#include <audsrv.h>
+#include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include "font.h"
@@ -26,7 +28,14 @@
 #define STBI_NO_THREAD_LOCALS
 #include "stb_image.h"
 
+#define MINIMP3_IMPLEMENTATION
+#define MINIMP3_ONLY_MP3
+#define MINIMP3_NO_SIMD
+#include "minimp3.h"
+
 extern unsigned char usbd_irx[];     extern unsigned int size_usbd_irx;
+extern unsigned char libsd_irx[];    extern unsigned int size_libsd_irx;
+extern unsigned char audsrv_irx[];   extern unsigned int size_audsrv_irx;
 extern unsigned char ps2mouse_irx[]; extern unsigned int size_ps2mouse_irx;
 extern unsigned char ps2kbd_irx[];   extern unsigned int size_ps2kbd_irx;
 extern unsigned char sio2man_irx[];  extern unsigned int size_sio2man_irx;
@@ -71,6 +80,8 @@ static void load_modules(void)
     SifExecModuleBuffer(bdm_irx, size_bdm_irx, 0, NULL, &ret);
     SifExecModuleBuffer(bdmfs_fatfs_irx, size_bdmfs_fatfs_irx, 0, NULL, &ret);
     SifExecModuleBuffer(usbmass_bd_irx, size_usbmass_bd_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(libsd_irx, size_libsd_irx, 0, NULL, &ret);
+    SifExecModuleBuffer(audsrv_irx, size_audsrv_irx, 0, NULL, &ret);
     SifExecModuleBuffer(ps2mouse_irx, size_ps2mouse_irx, 0, NULL, &ret);
     SifExecModuleBuffer(ps2kbd_irx, size_ps2kbd_irx, 0, NULL, &ret);
 }
@@ -236,9 +247,18 @@ static int is_jpg(const char *n)
     return (l > 4 && !strcasecmp(n + l - 4, ".jpg")) || (l > 5 && !strcasecmp(n + l - 5, ".jpeg"));
 }
 
+static int is_mp3(const char *n)
+{
+    int l = strlen(n);
+    return l > 4 && !strcasecmp(n + l - 4, ".mp3");
+}
+
+static void mp_open_from_fm(int idx);
+static void open_app(int app);
+
 /* ---------- file manager (My Computer) ---------- */
 #define FM_MAX 256
-typedef struct { char name[40]; int dir; unsigned int size; } FMEntry;
+typedef struct { char name[100]; int dir; unsigned int size; } FMEntry;
 static struct {
     char path[256];
     FMEntry e[FM_MAX];
@@ -257,8 +277,8 @@ static int fm_cmp(const void *a, const void *b)
 static void fm_add(const char *name, int dir, unsigned int size)
 {
     if (fm.count >= FM_MAX) return;
-    strncpy(fm.e[fm.count].name, name, 39);
-    fm.e[fm.count].name[39] = 0;
+    strncpy(fm.e[fm.count].name, name, 99);
+    fm.e[fm.count].name[99] = 0;
     fm.e[fm.count].dir = dir;
     fm.e[fm.count].size = size;
     fm.count++;
@@ -338,6 +358,9 @@ static void fm_enter(int idx)
                 snprintf(full, sizeof(full), "%s%s", fm.path, fm.e[idx].name);
                 wp_load(full, 0);
             }
+        } else if (is_mp3(fm.e[idx].name)) {
+            if (fm.demo) set_status("NO USB - PRESS PLAY IN PLAYER FOR TEST TONE");
+            else mp_open_from_fm(idx);
         }
         return;
     }
@@ -859,6 +882,283 @@ static void draw_sol(Win *w)
     }
 }
 
+/* ---------- Media Player (MP3 via minimp3 + audsrv, spectrum visualizer) ---------- */
+#define MP_MAX 64
+#define FFT_N 512
+#define FFT_LOG 9
+#define NBARS 24
+static int audsrv_ok = 0;
+static struct {
+    char dir[256];
+    char names[MP_MAX][100];
+    int n, cur, state, scroll;          // state: 0 stopped, 1 playing, 2 paused
+    unsigned char *buf;
+    long size, pos;
+    mp3dec_t dec;
+    int hz, kbps, vol, demo;
+    unsigned int played, tone_n;
+    float tone_ph;
+    short vis[FFT_N];
+    float bars[NBARS];
+} mp;
+static float fft_c[FFT_N / 2], fft_s[FFT_N / 2], fft_w[FFT_N];
+static int bar_edge[NBARS + 1];
+
+static void mp_init(void)
+{
+    int i, prev = 1;
+    for (i = 0; i < FFT_N / 2; i++) { fft_c[i] = cosf(6.2831853f * i / FFT_N); fft_s[i] = sinf(6.2831853f * i / FFT_N); }
+    for (i = 0; i < FFT_N; i++) fft_w[i] = 0.5f - 0.5f * cosf(6.2831853f * i / (FFT_N - 1));
+    for (i = 0; i <= NBARS; i++) {
+        int e = (int)powf(230.0f, (float)i / NBARS);
+        if (e <= prev && i > 0) e = prev + 1;
+        bar_edge[i] = e; prev = e;
+    }
+    mp.vol = 80;
+    if (audsrv_ok) audsrv_set_volume(mp.vol);
+}
+
+static void mp_stop(void)
+{
+    if (mp.buf) { free(mp.buf); mp.buf = NULL; }
+    mp.state = 0;
+    if (audsrv_ok) audsrv_stop_audio();
+}
+
+static void mp_fix_scroll(void)
+{
+    if (mp.cur < mp.scroll) mp.scroll = mp.cur;
+    if (mp.cur >= mp.scroll + 6) mp.scroll = mp.cur - 5;
+    if (mp.scroll < 0) mp.scroll = 0;
+}
+
+static int mp_load(int idx)
+{
+    char full[400];
+    FILE *f;
+    long sz;
+    mp_stop();
+    mp.demo = 0;
+    if (idx < 0 || idx >= mp.n) return -1;
+    snprintf(full, sizeof(full), "%s%s", mp.dir, mp.names[idx]);
+    f = fopen(full, "rb");
+    if (!f) { set_status("CANT OPEN FILE"); return -1; }
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 20 * 1024 * 1024) { fclose(f); set_status("MP3 TOO BIG (MAX 20 MB)"); return -1; }
+    mp.buf = malloc(sz);
+    if (!mp.buf) { fclose(f); set_status("OUT OF MEMORY"); return -1; }
+    if (fread(mp.buf, 1, sz, f) != (size_t)sz) { fclose(f); free(mp.buf); mp.buf = NULL; set_status("READ ERROR"); return -1; }
+    fclose(f);
+    mp.size = sz; mp.pos = 0; mp.played = 0; mp.hz = 0; mp.kbps = 0; mp.cur = idx;
+    mp3dec_init(&mp.dec);
+    mp.state = 1;
+    mp_fix_scroll();
+    return 0;
+}
+
+static void mp_next(void)
+{
+    if (mp.cur + 1 < mp.n) mp_load(mp.cur + 1);
+    else { mp_stop(); set_status("END OF PLAYLIST"); }
+}
+
+static void mp_open_from_fm(int idx)
+{
+    int i, cur = 0;
+    mp.n = 0;
+    strncpy(mp.dir, fm.path, sizeof(mp.dir) - 1);
+    mp.dir[sizeof(mp.dir) - 1] = 0;
+    for (i = 0; i < fm.count && mp.n < MP_MAX; i++) {
+        if (!fm.e[i].dir && is_mp3(fm.e[i].name)) {
+            if (i == idx) cur = mp.n;
+            strncpy(mp.names[mp.n], fm.e[i].name, 99);
+            mp.names[mp.n][99] = 0;
+            mp.n++;
+        }
+    }
+    open_app(3);
+    mp_load(cur);
+}
+
+static void mp_pump(void)
+{
+    short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME], out[1152 * 2];
+    int iter, i, samples = 0, hz = 44100;
+    if (mp.state != 1 || !audsrv_ok) return;
+    for (iter = 0; iter < 3; iter++) {
+        if (audsrv_available() < 4608 + 512) break;
+        if (mp.demo) {
+            samples = 1152;
+            for (i = 0; i < samples; i++) {
+                float t = (float)mp.tone_n++ / 44100.0f;
+                float f = 330.0f + 220.0f * sinf(t * 0.8f);
+                float amp = 0.4f * (0.65f + 0.35f * sinf(t * 6.0f));
+                float v;
+                mp.tone_ph += 6.2831853f * f / 44100.0f;
+                if (mp.tone_ph > 6.2831853f * 1000.0f) mp.tone_ph = 0;
+                v = sinf(mp.tone_ph) * 0.6f + sinf(mp.tone_ph * 2.01f) * 0.25f + sinf(mp.tone_ph * 3.02f) * 0.12f;
+                out[2 * i] = out[2 * i + 1] = (short)(v * amp * 20000.0f);
+            }
+        } else {
+            mp3dec_frame_info_t info;
+            if (!mp.buf || mp.pos >= mp.size) { mp_next(); return; }
+            samples = mp3dec_decode_frame(&mp.dec, mp.buf + mp.pos, (int)(mp.size - mp.pos), pcm, &info);
+            if (info.frame_bytes <= 0) { mp_next(); return; }
+            mp.pos += info.frame_bytes;
+            if (samples <= 0) continue;
+            hz = info.hz;
+            if (!mp.kbps) mp.kbps = info.bitrate_kbps;
+            if (info.channels == 1) for (i = 0; i < samples; i++) out[2 * i] = out[2 * i + 1] = pcm[i];
+            else memcpy(out, pcm, samples * 4);
+        }
+        if (mp.hz != hz) {
+            audsrv_fmt_t fmt;
+            fmt.freq = hz; fmt.bits = 16; fmt.channels = 2;
+            audsrv_set_format(&fmt);
+            mp.hz = hz;
+        }
+        audsrv_play_audio((char *)out, samples * 4);
+        mp.played += samples;
+        for (i = 0; i < FFT_N; i++) {
+            int si = samples - FFT_N + i;
+            mp.vis[i] = (si >= 0) ? (short)(((int)out[2 * si] + out[2 * si + 1]) / 2) : 0;
+        }
+    }
+}
+
+static void mp_viz_update(void)
+{
+    float re[FFT_N], im[FFT_N];
+    int i, j, k, len, b;
+    if (mp.state != 1) { for (b = 0; b < NBARS; b++) mp.bars[b] *= 0.85f; return; }
+    for (i = 0; i < FFT_N; i++) {
+        int r = 0, bb = i;
+        for (k = 0; k < FFT_LOG; k++) { r = (r << 1) | (bb & 1); bb >>= 1; }
+        re[r] = mp.vis[i] * fft_w[i];
+        im[r] = 0;
+    }
+    for (len = 2; len <= FFT_N; len <<= 1) {
+        int half = len / 2, step = FFT_N / len;
+        for (i = 0; i < FFT_N; i += len)
+            for (j = 0; j < half; j++) {
+                float wr = fft_c[j * step], wi = -fft_s[j * step];
+                float xr = re[i + j + half], xi = im[i + j + half];
+                float tr = xr * wr - xi * wi, ti = xr * wi + xi * wr;
+                re[i + j + half] = re[i + j] - tr; im[i + j + half] = im[i + j] - ti;
+                re[i + j] += tr; im[i + j] += ti;
+            }
+    }
+    for (b = 0; b < NBARS; b++) {
+        float sum = 0, v, x;
+        int lo = bar_edge[b], hi = bar_edge[b + 1], n = 0;
+        if (hi > FFT_N / 2 - 1) hi = FFT_N / 2 - 1;
+        for (i = lo; i < hi; i++) { sum += re[i] * re[i] + im[i] * im[i]; n++; }
+        x = n ? sqrtf(sum / n) / (32768.0f * FFT_N / 4.0f) : 0;
+        v = (20.0f * log10f(x + 1e-6f) + 62.0f) / 56.0f;
+        if (v < 0) v = 0;
+        if (v > 1) v = 1;
+        mp.bars[b] = (v > mp.bars[b]) ? v : mp.bars[b] * 0.86f;
+    }
+}
+
+static void tri_right(int x, int cy, u64 c)
+{
+    int k;
+    for (k = 0; k < 8; k++) { int h = 7 - k; rect(x + k, cy - h, x + k + 1, cy + h + 1, c); }
+}
+static void tri_left(int x, int cy, u64 c)
+{
+    int k;
+    for (k = 0; k < 8; k++) { int h = 7 - k; rect(x + 7 - k, cy - h, x + 8 - k, cy + h + 1, c); }
+}
+
+static void draw_mp(Win *w)
+{
+    int bx = w->x + 3, by = w->y + TITLE_H, i, s, r;
+    char buf[48];
+    int el = mp.hz ? (int)(mp.played / mp.hz) : 0;
+    int dur = (mp.kbps > 0 && !mp.demo) ? (int)(mp.size * 8 / (mp.kbps * 1000)) : 0;
+    u64 white = RGB(255, 255, 255), bg = RGB(40, 46, 66);
+    rect(bx, by, w->x + w->w - 3, w->y + w->h - 3, bg);
+    // visualizer
+    rect(bx + 8, by + 8, bx + 352, by + 118, RGB(90, 100, 130));
+    rect(bx + 9, by + 9, bx + 351, by + 117, RGB(0, 0, 0));
+    for (i = 0; i < NBARS; i++) {
+        int n = (int)(mp.bars[i] * 20.0f), bxl = bx + 12 + i * 14;
+        for (s = 0; s < n; s++) {
+            u64 c = s < 12 ? RGB(40, 220, 60) : s < 17 ? RGB(240, 220, 40) : RGB(240, 50, 40);
+            rect(bxl, by + 113 - s * 5 - 4, bxl + 12, by + 113 - s * 5, c);
+        }
+    }
+    // title
+    if (!audsrv_ok) draw_text(bx + 8, by + 124, "AUDIO NOT AVAILABLE", 56, 1, RGB(255, 120, 120));
+    else if (mp.demo && mp.state) draw_text(bx + 8, by + 124, "TEST TONE (NO MP3 LOADED)", 56, 1, white);
+    else if (mp.n > 0) draw_text(bx + 8, by + 124, mp.names[mp.cur], 56, 1, white);
+    else draw_text(bx + 8, by + 124, "NO FILE - DOUBLE-CLICK AN MP3 IN MY COMPUTER", 56, 1, RGB(190, 200, 230));
+    // time
+    if (dur > 0) snprintf(buf, sizeof(buf), "%02d:%02d / %02d:%02d", el / 60, el % 60, dur / 60, dur % 60);
+    else snprintf(buf, sizeof(buf), "%02d:%02d / --:--", el / 60, el % 60);
+    draw_text(bx + 8, by + 138, buf, 20, 1, RGB(120, 220, 255));
+    // progress
+    rect(bx + 8, by + 154, bx + 352, by + 160, RGB(90, 100, 130));
+    if (dur > 0) { int fw = (int)(344L * el / dur); if (fw > 344) fw = 344; rect(bx + 8, by + 154, bx + 8 + fw, by + 160, RGB(255, 150, 30)); }
+    // transport buttons: prev, play/pause, stop, next
+    for (i = 0; i < 4; i++) {
+        int x0 = bx + 8 + i * 36;
+        rect(x0, by + 168, x0 + 32, by + 192, RGB(170, 180, 205));
+        rect(x0 + 1, by + 169, x0 + 31, by + 191, RGB(225, 228, 240));
+    }
+    rect(bx + 14, by + 173, bx + 16, by + 187, RGB(20, 20, 20)); tri_left(bx + 17, by + 180, RGB(20, 20, 20));
+    if (mp.state == 1) { rect(bx + 54, by + 173, bx + 58, by + 187, RGB(20, 20, 20)); rect(bx + 62, by + 173, bx + 66, by + 187, RGB(20, 20, 20)); }
+    else tri_right(bx + 56, by + 180, RGB(20, 130, 40));
+    rect(bx + 90, by + 174, bx + 102, by + 186, RGB(20, 20, 20));
+    tri_right(bx + 124, by + 180, RGB(20, 20, 20)); rect(bx + 133, by + 173, bx + 135, by + 187, RGB(20, 20, 20));
+    // volume
+    draw_text(bx + 190, by + 176, "VOL", 3, 1, white);
+    rect(bx + 220, by + 168, bx + 246, by + 192, RGB(225, 228, 240)); draw_text(bx + 230, by + 176, "-", 1, 1, RGB(20, 20, 20));
+    snprintf(buf, sizeof(buf), "%d", mp.vol);
+    draw_text(bx + 254, by + 176, buf, 3, 1, white);
+    rect(bx + 286, by + 168, bx + 312, by + 192, RGB(225, 228, 240)); draw_text(bx + 296, by + 176, "+", 1, 1, RGB(20, 20, 20));
+    // playlist
+    rect(bx + 8, by + 200, bx + 352, by + 296, RGB(250, 250, 252));
+    for (r = 0; r < 6; r++) {
+        int idx = mp.scroll + r, ry = by + 204 + r * 15;
+        if (idx >= mp.n) break;
+        if (idx == mp.cur) rect(bx + 10, ry - 2, bx + 350, ry + 12, RGB(50, 90, 200));
+        draw_text(bx + 16, ry + 2, mp.names[idx], 52, 1, idx == mp.cur ? white : RGB(20, 20, 20));
+    }
+}
+
+static void mp_click(Win *w, int mx, int my, int frame)
+{
+    int bx = w->x + 3, by = w->y + TITLE_H, i;
+    (void)frame;
+    if (my >= by + 168 && my < by + 192) {
+        for (i = 0; i < 4; i++) {
+            int x0 = bx + 8 + i * 36;
+            if (mx >= x0 && mx < x0 + 32) {
+                if (i == 0) { if (mp.n > 0) mp_load(mp.cur > 0 ? mp.cur - 1 : 0); }
+                else if (i == 1) {
+                    if (mp.state == 1) mp.state = 2;
+                    else if (mp.state == 2) mp.state = 1;
+                    else if (mp.n > 0) mp_load(mp.cur);
+                    else { mp.demo = 1; mp.state = 1; mp.hz = 0; mp.played = 0; mp.kbps = 0; }
+                }
+                else if (i == 2) mp_stop();
+                else { if (mp.n > 0) mp_next(); }
+                return;
+            }
+        }
+        if (mx >= bx + 220 && mx < bx + 246) { mp.vol = mp.vol > 10 ? mp.vol - 10 : 0; if (audsrv_ok) audsrv_set_volume(mp.vol); }
+        if (mx >= bx + 286 && mx < bx + 312) { mp.vol = mp.vol < 90 ? mp.vol + 10 : 100; if (audsrv_ok) audsrv_set_volume(mp.vol); }
+        return;
+    }
+    if (my >= by + 202 && my < by + 296 && mx >= bx + 8 && mx < bx + 352) {
+        int idx = mp.scroll + (my - (by + 202)) / 15;
+        if (idx < mp.n) mp_load(idx);
+    }
+}
+
 /* ---------- window manager ---------- */
 static int top_slot(void) { return nopen ? order[nopen - 1] : -1; }
 
@@ -889,8 +1189,8 @@ static void open_app(int app)
     if (slot < 0) return;
     wins[slot].open = 1;
     wins[slot].app = app;
-    wins[slot].w = (app == 0) ? 380 : (app == 1) ? 198 : (app == 2) ? 312 : 300;
-    wins[slot].h = (app == 0) ? 290 : (app == 1) ? 250 : (app == 2) ? 360 : 200;
+    wins[slot].w = (app == 0) ? 380 : (app == 1) ? 198 : (app == 2) ? 312 : (app == 3) ? 360 : 300;
+    wins[slot].h = (app == 0) ? 290 : (app == 1) ? 250 : (app == 2) ? 360 : (app == 3) ? 326 : 200;
     wins[slot].x = 110 + (nopen % 6) * 28;
     wins[slot].y = 20 + (nopen % 6) * 28;
     order[nopen++] = slot;
@@ -918,6 +1218,7 @@ static void draw_window(int slot, int active)
     else if (w->app == 4) draw_settings(w);
     else if (w->app == 1) draw_ms(w);
     else if (w->app == 2) draw_sol(w);
+    else if (w->app == 3) draw_mp(w);
     else draw_text(x + 20, y + 80, "COMING SOON", 20, 2, RGB(90, 90, 90));
 }
 
@@ -1065,6 +1366,8 @@ int main(void)
     PS2MouseInit();
     padInit(0);
     padPortOpen(0, 0, pad_buf);
+    audsrv_ok = (audsrv_init() == 0);
+    mp_init();
 
     while (1) {
         int W = gs->Width, H = gs->Height;
@@ -1133,6 +1436,7 @@ int main(void)
                     else if (w->app == 4) settings_click(w, mx, my);
                     else if (w->app == 1) ms_click(w, mx, my, 0);
                     else if (w->app == 2) sl_click(w, mx, my, 0);
+                    else if (w->app == 3) mp_click(w, mx, my, frame);
                     handled = 1;
                 }
             }
@@ -1165,6 +1469,9 @@ int main(void)
         }
         if (released) drag = -1;
         prev = buttons;
+
+        mp_pump();
+        mp_viz_update();
 
         // ----- draw -----
         g_frame = frame;
