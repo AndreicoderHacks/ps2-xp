@@ -412,6 +412,8 @@ static unsigned short pad_prev = 0;
 static char pad_buf[256] __attribute__((aligned(64)));
 static int menu_open = 0;
 
+#define STICK_DZ 40   // dead zone for stick drift (0-127); raise if the cursor still drifts
+
 static int pad_poll(int *dx, int *dy, unsigned short *btns)
 {
     struct padButtonStatus pb;
@@ -423,8 +425,8 @@ static int pad_poll(int *dx, int *dy, unsigned short *btns)
     *btns = 0xffff ^ pb.btns;
     if ((pb.mode & 0xf0) == 0x70) {          // analog (DualShock) mode
         int hx = (int)pb.ljoy_h - 128, vy = (int)pb.ljoy_v - 128;
-        if (abs(hx) > 24) sx = hx / 12;
-        if (abs(vy) > 24) sy = vy / 12;
+        if (abs(hx) > STICK_DZ) sx = (hx > 0 ? hx - STICK_DZ : hx + STICK_DZ) / 8;
+        if (abs(vy) > STICK_DZ) sy = (vy > 0 ? vy - STICK_DZ : vy + STICK_DZ) / 8;
     }
     if (*btns & PAD_LEFT)  sx -= 4;
     if (*btns & PAD_RIGHT) sx += 4;
@@ -618,6 +620,245 @@ static void draw_ms(Win *w)
         }
 }
 
+/* ---------- Solitaire (Klondike, click-to-select) ---------- */
+#define SL_CW 38
+#define SL_CH 50
+#define SL_PITCH 42
+static struct {
+    int tab[7][20], tn[7], down[7];
+    int stock[24], sn, waste[24], wn;
+    int found[4];
+    int sel_kind, sel_col, sel_idx;   // 0 none, 1 waste, 2 tableau, 3 foundation
+    int won;
+} sl;
+
+static const unsigned char suit_gl[4][7] = {
+    {0x36, 0x7F, 0x7F, 0x7F, 0x3E, 0x1C, 0x08},   // hearts
+    {0x08, 0x1C, 0x3E, 0x7F, 0x3E, 0x1C, 0x08},   // diamonds
+    {0x1C, 0x1C, 0x6B, 0x7F, 0x6B, 0x08, 0x1C},   // clubs
+    {0x08, 0x1C, 0x3E, 0x7F, 0x7F, 0x08, 0x1C}    // spades
+};
+static const char *rank_str[13] = {"A","2","3","4","5","6","7","8","9","10","J","Q","K"};
+
+static int sl_red(int c) { return (c / 13) < 2; }
+static int sl_rank(int c) { return c % 13; }
+
+static void sl_deal(void)
+{
+    int deck[52], i, j, k = 0, t;
+    memset(&sl, 0, sizeof(sl));
+    for (i = 0; i < 52; i++) deck[i] = i;
+    srand(g_frame * 31337 + 7);
+    for (i = 51; i > 0; i--) { j = rand() % (i + 1); t = deck[i]; deck[i] = deck[j]; deck[j] = t; }
+    for (i = 0; i < 7; i++) {
+        for (j = 0; j <= i; j++) sl.tab[i][sl.tn[i]++] = deck[k++];
+        sl.down[i] = i;
+    }
+    while (k < 52) sl.stock[sl.sn++] = deck[k++];
+}
+
+static int sl_top_tab(int col) { return sl.tn[col] ? sl.tab[col][sl.tn[col] - 1] : -1; }
+
+static int sl_can_tab(int card, int col)
+{
+    int t = sl_top_tab(col);
+    if (t < 0) return sl_rank(card) == 12;
+    return sl_red(t) != sl_red(card) && sl_rank(t) == sl_rank(card) + 1;
+}
+
+static int sl_can_found(int card) { return sl.found[card / 13] == sl_rank(card); }
+
+static void sl_after_move(void)
+{
+    int i;
+    for (i = 0; i < 7; i++) {
+        if (sl.tn[i] == 0) sl.down[i] = 0;
+        else if (sl.down[i] >= sl.tn[i]) sl.down[i] = sl.tn[i] - 1;
+    }
+    sl.sel_kind = 0;
+    if (sl.found[0] + sl.found[1] + sl.found[2] + sl.found[3] == 52) sl.won = 1;
+}
+
+static int sl_try_tab(int dest)
+{
+    int card, j;
+    if (sl.sel_kind == 1) {
+        if (!sl.wn) return 0;
+        card = sl.waste[sl.wn - 1];
+        if (!sl_can_tab(card, dest)) return 0;
+        sl.tab[dest][sl.tn[dest]++] = card; sl.wn--;
+    } else if (sl.sel_kind == 2) {
+        int c = sl.sel_col, k = sl.sel_idx;
+        if (c == dest) return 0;
+        card = sl.tab[c][k];
+        if (!sl_can_tab(card, dest)) return 0;
+        for (j = k; j < sl.tn[c]; j++) sl.tab[dest][sl.tn[dest]++] = sl.tab[c][j];
+        sl.tn[c] = k;
+    } else if (sl.sel_kind == 3) {
+        int s = sl.sel_col;
+        card = s * 13 + sl.found[s] - 1;
+        if (!sl_can_tab(card, dest)) return 0;
+        sl.tab[dest][sl.tn[dest]++] = card; sl.found[s]--;
+    } else return 0;
+    sl_after_move();
+    return 1;
+}
+
+static int sl_try_found(void)
+{
+    int card;
+    if (sl.sel_kind == 1 && sl.wn) {
+        card = sl.waste[sl.wn - 1];
+        if (!sl_can_found(card)) return 0;
+        sl.found[card / 13]++; sl.wn--;
+    } else if (sl.sel_kind == 2 && sl.sel_idx == sl.tn[sl.sel_col] - 1) {
+        card = sl.tab[sl.sel_col][sl.sel_idx];
+        if (!sl_can_found(card)) return 0;
+        sl.found[card / 13]++; sl.tn[sl.sel_col]--;
+    } else return 0;
+    sl_after_move();
+    return 1;
+}
+
+static int sl_tab_y(int y0, int col, int idx)
+{
+    int j, y = y0;
+    for (j = 0; j < idx; j++) y += (j < sl.down[col]) ? 6 : 14;
+    return y;
+}
+
+// returns card index under my in column, -2 if empty column area hit, -1 if none
+static int sl_hit(int y0, int col, int my)
+{
+    int i;
+    if (sl.tn[col] == 0) return (my >= y0 && my < y0 + SL_CH) ? -2 : -1;
+    for (i = sl.tn[col] - 1; i >= 0; i--) {
+        int yy = sl_tab_y(y0, col, i);
+        int hh = (i == sl.tn[col] - 1) ? SL_CH : ((i < sl.down[col]) ? 6 : 14);
+        if (my >= yy && my < yy + hh) return i;
+    }
+    return -1;
+}
+
+static void sl_click(Win *w, int mx, int my, int right)
+{
+    int bx = w->x + 9, ty = w->y + TITLE_H + 8, y0 = w->y + TITLE_H + 70;
+    int col, within, idx;
+    if (mx < bx) return;
+    col = (mx - bx) / SL_PITCH;
+    within = (mx - bx) % SL_PITCH;
+    if (col < 0 || col > 6 || within >= SL_CW) return;
+
+    if (my >= ty && my < ty + SL_CH) {            // top row
+        if (col == 2) { if (!right && my < ty + 22) sl_deal(); return; }
+        if (sl.won) return;
+        if (col == 0) {
+            if (right) return;
+            if (sl.sn > 0) sl.waste[sl.wn++] = sl.stock[--sl.sn];
+            else while (sl.wn > 0) sl.stock[sl.sn++] = sl.waste[--sl.wn];
+            sl.sel_kind = 0;
+        } else if (col == 1) {
+            if (!sl.wn) return;
+            if (right) { sl.sel_kind = 1; if (!sl_try_found()) sl.sel_kind = 0; }
+            else sl.sel_kind = (sl.sel_kind == 1) ? 0 : 1;
+        } else if (col >= 3) {
+            int f = col - 3;
+            if (right) return;
+            if (sl.sel_kind == 1 || sl.sel_kind == 2) { if (!sl_try_found()) sl.sel_kind = 0; }
+            else if (sl.sel_kind == 3) sl.sel_kind = 0;
+            else if (sl.found[f] > 0) { sl.sel_kind = 3; sl.sel_col = f; }
+        }
+        return;
+    }
+    if (my < y0 || sl.won) return;
+    idx = sl_hit(y0, col, my);
+    if (idx == -1) return;
+    if (right) {                                   // auto-send top card to foundation
+        if (idx >= 0 && idx == sl.tn[col] - 1) {
+            sl.sel_kind = 2; sl.sel_col = col; sl.sel_idx = idx;
+            if (!sl_try_found()) sl.sel_kind = 0;
+        }
+        return;
+    }
+    if (sl.sel_kind != 0) {
+        if (sl_try_tab(col)) return;
+        sl.sel_kind = 0;
+    }
+    if (idx >= 0 && idx >= sl.down[col]) { sl.sel_kind = 2; sl.sel_col = col; sl.sel_idx = idx; }
+}
+
+static void draw_suit(int x, int y, int s, int sc, u64 col)
+{
+    int r, c;
+    for (r = 0; r < 7; r++) {
+        c = 0;
+        while (c < 7) {
+            if ((suit_gl[s][r] >> (6 - c)) & 1) {
+                int st = c;
+                while (c < 7 && ((suit_gl[s][r] >> (6 - c)) & 1)) c++;
+                rect(x + st * sc, y + r * sc, x + c * sc, y + (r + 1) * sc, col);
+            } else c++;
+        }
+    }
+}
+
+static void draw_card(int x, int y, int card, int up, int sel)
+{
+    rect(x, y, x + SL_CW, y + SL_CH, sel ? RGB(255, 230, 0) : RGB(30, 30, 30));
+    if (up) {
+        u64 col = sl_red(card) ? RGB(210, 20, 20) : RGB(15, 15, 15);
+        rect(x + 1, y + 1, x + SL_CW - 1, y + SL_CH - 1, RGB(250, 250, 245));
+        draw_text(x + 3, y + 3, rank_str[sl_rank(card)], 2, 1, col);
+        draw_suit(x + 3, y + 13, card / 13, 1, col);
+        draw_suit(x + 19, y + 30, card / 13, 2, col);
+    } else {
+        rect(x + 1, y + 1, x + SL_CW - 1, y + SL_CH - 1, RGB(30, 60, 170));
+        rect(x + 4, y + 4, x + SL_CW - 4, y + SL_CH - 4, RGB(90, 130, 230));
+        rect(x + 6, y + 6, x + SL_CW - 6, y + SL_CH - 6, RGB(30, 60, 170));
+    }
+}
+
+static void draw_slot(int x, int y)
+{
+    rect(x, y, x + SL_CW, y + SL_CH, RGB(0, 80, 35));
+    rect(x + 1, y + 1, x + SL_CW - 1, y + SL_CH - 1, RGB(0, 110, 50));
+}
+
+static void draw_sol(Win *w)
+{
+    int bx = w->x + 9, ty = w->y + TITLE_H + 8, y0 = w->y + TITLE_H + 70;
+    int i, j;
+    rect(w->x + 3, w->y + TITLE_H, w->x + w->w - 3, w->y + w->h - 3, RGB(0, 110, 50));
+    // stock
+    if (sl.sn > 0) draw_card(bx, ty, 0, 0, 0); else draw_slot(bx, ty);
+    // waste
+    if (sl.wn > 0) draw_card(bx + SL_PITCH, ty, sl.waste[sl.wn - 1], 1, sl.sel_kind == 1);
+    else draw_slot(bx + SL_PITCH, ty);
+    // NEW button
+    rect(bx + 2 * SL_PITCH, ty, bx + 2 * SL_PITCH + SL_CW, ty + 20, RGB(60, 60, 60));
+    rect(bx + 2 * SL_PITCH + 1, ty + 1, bx + 2 * SL_PITCH + SL_CW - 1, ty + 19, RGB(225, 225, 232));
+    draw_text(bx + 2 * SL_PITCH + 8, ty + 7, "NEW", 3, 1, RGB(20, 20, 20));
+    // foundations
+    for (i = 0; i < 4; i++) {
+        int fx = bx + (3 + i) * SL_PITCH;
+        if (sl.found[i] > 0) draw_card(fx, ty, i * 13 + sl.found[i] - 1, 1, sl.sel_kind == 3 && sl.sel_col == i);
+        else { draw_slot(fx, ty); draw_suit(fx + 12, ty + 18, i, 2, RGB(0, 150, 70)); }
+    }
+    // tableau
+    for (i = 0; i < 7; i++) {
+        int cx = bx + i * SL_PITCH;
+        if (sl.tn[i] == 0) { draw_slot(cx, y0); continue; }
+        for (j = 0; j < sl.tn[i]; j++) {
+            int sel = (sl.sel_kind == 2 && sl.sel_col == i && j >= sl.sel_idx);
+            draw_card(cx, sl_tab_y(y0, i, j), sl.tab[i][j], j >= sl.down[i], sel);
+        }
+    }
+    if (sl.won) {
+        rect(bx + 40, y0 + 80, bx + 250, y0 + 130, RGB(0, 0, 0));
+        draw_text(bx + 52, y0 + 94, "YOU WIN!", 8, 3, RGB(255, 230, 0));
+    }
+}
+
 /* ---------- window manager ---------- */
 static int top_slot(void) { return nopen ? order[nopen - 1] : -1; }
 
@@ -648,13 +889,14 @@ static void open_app(int app)
     if (slot < 0) return;
     wins[slot].open = 1;
     wins[slot].app = app;
-    wins[slot].w = (app == 0) ? 380 : (app == 1) ? 198 : 300;
-    wins[slot].h = (app == 0) ? 290 : (app == 1) ? 250 : 200;
+    wins[slot].w = (app == 0) ? 380 : (app == 1) ? 198 : (app == 2) ? 312 : 300;
+    wins[slot].h = (app == 0) ? 290 : (app == 1) ? 250 : (app == 2) ? 360 : 200;
     wins[slot].x = 110 + (nopen % 6) * 28;
     wins[slot].y = 20 + (nopen % 6) * 28;
     order[nopen++] = slot;
     if (app == 0) fm_refresh();
     if (app == 1) ms_reset();
+    if (app == 2) sl_deal();
 }
 
 static void draw_window(int slot, int active)
@@ -675,6 +917,7 @@ static void draw_window(int slot, int active)
     if (w->app == 0) draw_fm(w);
     else if (w->app == 4) draw_settings(w);
     else if (w->app == 1) draw_ms(w);
+    else if (w->app == 2) draw_sol(w);
     else draw_text(x + 20, y + 80, "COMING SOON", 20, 2, RGB(90, 90, 90));
 }
 
@@ -682,14 +925,87 @@ static void draw_window(int slot, int active)
 static int icon_x(void) { return 24; }
 static int icon_y(int i) { return 20 + i * 84; }
 
+static int isqrt_i(int n) { int r = 0; while ((r + 1) * (r + 1) <= n) r++; return r; }
+
+static void draw_disc(int cx, int cy, int r, u64 col)
+{
+    int dy;
+    for (dy = -r; dy <= r; dy++) {
+        int dx = isqrt_i(r * r - dy * dy);
+        rect(cx - dx, cy + dy, cx + dx + 1, cy + dy + 1, col);
+    }
+}
+
+// Windows-style 48x48 icons drawn from primitives
+static void draw_app_icon(int app, int x, int y)
+{
+    int k;
+    if (app == 0) {                                   // My Computer: monitor
+        rect(x + 3, y + 4, x + 45, y + 36, RGB(70, 70, 80));
+        rect(x + 4, y + 5, x + 44, y + 35, RGB(205, 205, 215));
+        rect(x + 4, y + 5, x + 44, y + 7, RGB(240, 240, 248));
+        vgrad(x + 8, y + 9, x + 40, y + 29, 40, 110, 230, 150, 200, 255);
+        rect(x + 8, y + 23, x + 40, y + 29, RGB(70, 170, 60));       // hill
+        rect(x + 8, y + 21, x + 24, y + 23, RGB(70, 170, 60));
+        rect(x + 40, y + 9, x + 41, y + 29, RGB(30, 60, 140));
+        rect(x + 8, y + 29, x + 40, y + 30, RGB(30, 60, 140));
+        rect(x + 36, y + 32, x + 40, y + 34, RGB(0, 220, 60));        // power LED
+        rect(x + 19, y + 36, x + 29, y + 40, RGB(170, 170, 182));     // neck
+        rect(x + 11, y + 40, x + 37, y + 44, RGB(70, 70, 80));        // base
+        rect(x + 12, y + 40, x + 36, y + 43, RGB(205, 205, 215));
+    } else if (app == 1) {                            // Minesweeper: mine on tile
+        rect(x + 2, y + 2, x + 46, y + 46, RGB(110, 110, 110));
+        rect(x + 2, y + 2, x + 44, y + 44, RGB(255, 255, 255));
+        rect(x + 5, y + 5, x + 44, y + 44, RGB(192, 192, 192));
+        rect(x + 22, y + 8, x + 27, y + 41, RGB(0, 0, 0));            // spikes
+        rect(x + 8, y + 22, x + 41, y + 27, RGB(0, 0, 0));
+        for (k = 0; k < 6; k++) {
+            rect(x + 10 + k * 2, y + 10 + k * 2, x + 14 + k * 2, y + 14 + k * 2, RGB(0, 0, 0));
+            rect(x + 34 - k * 2, y + 10 + k * 2, x + 38 - k * 2, y + 14 + k * 2, RGB(0, 0, 0));
+        }
+        draw_disc(x + 24, y + 24, 11, RGB(0, 0, 0));
+        draw_disc(x + 20, y + 20, 3, RGB(255, 255, 255));
+        rect(x + 33, y + 6, x + 35, y + 17, RGB(0, 0, 0));            // little flag
+        rect(x + 35, y + 6, x + 42, y + 11, RGB(230, 20, 20));
+    } else if (app == 2) {                            // Solitaire: cards on felt
+        rect(x + 2, y + 2, x + 46, y + 46, RGB(0, 70, 30));
+        rect(x + 3, y + 3, x + 45, y + 45, RGB(0, 125, 55));
+        rect(x + 7, y + 8, x + 29, y + 42, RGB(25, 25, 25));          // back card
+        rect(x + 8, y + 9, x + 28, y + 41, RGB(30, 60, 170));
+        rect(x + 11, y + 12, x + 25, y + 38, RGB(100, 140, 235));
+        rect(x + 13, y + 14, x + 23, y + 36, RGB(30, 60, 170));
+        rect(x + 17, y + 5, x + 42, y + 44, RGB(25, 25, 25));         // front card
+        rect(x + 18, y + 6, x + 41, y + 43, RGB(252, 252, 248));
+        draw_text(x + 21, y + 9, "A", 1, 2, RGB(210, 20, 20));
+        draw_suit(x + 21, y + 22, 0, 3, RGB(210, 20, 20));
+    } else if (app == 3) {                            // Media Player: orange orb + play
+        draw_disc(x + 24, y + 24, 22, RGB(15, 45, 130));
+        draw_disc(x + 24, y + 24, 19, RGB(240, 120, 10));
+        draw_disc(x + 23, y + 20, 14, RGB(255, 165, 50));
+        draw_disc(x + 22, y + 15, 8, RGB(255, 205, 120));
+        for (k = 0; k < 13; k++) {
+            int half = 11 - (k * 11) / 13;
+            rect(x + 18 + k, y + 24 - half, x + 19 + k, y + 24 + half + 1, RGB(255, 255, 255));
+        }
+    } else {                                          // Settings: gear
+        draw_disc(x + 24, y + 24, 18, RGB(110, 110, 120));
+        rect(x + 20, y + 3, x + 28, y + 11, RGB(110, 110, 120));
+        rect(x + 20, y + 37, x + 28, y + 45, RGB(110, 110, 120));
+        rect(x + 3, y + 20, x + 11, y + 28, RGB(110, 110, 120));
+        rect(x + 37, y + 20, x + 45, y + 28, RGB(110, 110, 120));
+        draw_disc(x + 24, y + 24, 15, RGB(185, 185, 195));
+        draw_disc(x + 24, y + 24, 6, RGB(236, 233, 216));
+    }
+}
+
 static void draw_icon(int i, int selected)
 {
     int x = icon_x(), y = icon_y(i);
-    if (selected) rect(x - 8, y - 4, x + 56, y + 76, RGB(50, 90, 200));
-    // simple colored placeholder icon per app
-    rect(x, y, x + 48, y + 48, RGB(255, 255, 255));
-    rect(x + 3, y + 3, x + 45, y + 45, i == 0 ? RGB(240, 200, 60) : i == 1 ? RGB(120, 120, 120) : i == 2 ? RGB(40, 150, 60) : RGB(230, 120, 30));
-    draw_text(x - 4, y + 54, app_names[i], 9, 1, RGB(255, 255, 255));
+    int len = strlen(app_names[i]), tx = x + 24 - len * 3;
+    if (selected) rect(x - 16, y - 4, x + 64, y + 68, RGB(50, 90, 200));
+    draw_app_icon(i, x, y);
+    draw_text(tx + 1, y + 55, app_names[i], 14, 1, RGB(0, 0, 0));      // shadow
+    draw_text(tx, y + 54, app_names[i], 14, 1, RGB(255, 255, 255));
 }
 
 static void draw_taskbar(int top)
@@ -816,13 +1132,14 @@ int main(void)
                     } else if (w->app == 0) fm_click(w, mx, my, frame);
                     else if (w->app == 4) settings_click(w, mx, my);
                     else if (w->app == 1) ms_click(w, mx, my, 0);
+                    else if (w->app == 2) sl_click(w, mx, my, 0);
                     handled = 1;
                 }
             }
             if (!handled) {
                 int hit = -1;
                 for (i = 0; i < NICONS; i++)
-                    if (mx >= icon_x() - 8 && mx < icon_x() + 56 && my >= icon_y(i) - 4 && my < icon_y(i) + 76) hit = i;
+                    if (mx >= icon_x() - 16 && mx < icon_x() + 64 && my >= icon_y(i) - 4 && my < icon_y(i) + 68) hit = i;
                 if (hit >= 0 && hit == last_icon && frame - last_click < 30) { open_app(hit); last_icon = -1; }
                 else { last_icon = hit; last_click = frame; }
                 sel_icon = hit;
@@ -841,6 +1158,7 @@ int main(void)
                 Win *w = &wins[order[i]];
                 if (mx >= w->x && mx < w->x + w->w && my >= w->y && my < w->y + w->h) {
                     if (w->app == 1 && my >= w->y + TITLE_H) ms_click(w, mx, my, 1);
+                    if (w->app == 2 && my >= w->y + TITLE_H) sl_click(w, mx, my, 1);
                     break;
                 }
             }
