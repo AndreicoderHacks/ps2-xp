@@ -36,6 +36,10 @@
 #define MINIMP3_NO_SIMD
 #include "minimp3.h"
 
+#include <sys/time.h>
+#define PL_MPEG_IMPLEMENTATION
+#include "pl_mpeg.h"
+
 extern unsigned char usbd_irx[];     extern unsigned int size_usbd_irx;
 extern unsigned char poweroff_irx[]; extern unsigned int size_poweroff_irx;
 extern unsigned char libsd_irx[];    extern unsigned int size_libsd_irx;
@@ -258,7 +262,14 @@ static int is_mp3(const char *n)
     return l > 4 && !strcasecmp(n + l - 4, ".mp3");
 }
 
+static int is_mpg(const char *n)
+{
+    int l = strlen(n);
+    return (l > 4 && !strcasecmp(n + l - 4, ".mpg")) || (l > 5 && !strcasecmp(n + l - 5, ".mpeg"));
+}
+
 static void mp_open_from_fm(int idx);
+static void vp_open_from_fm(int idx);
 static void open_app(int app);
 
 /* ---------- global settings + persistent ini ---------- */
@@ -406,6 +417,9 @@ static void fm_enter(int idx)
         } else if (is_mp3(fm.e[idx].name)) {
             if (fm.demo) set_status("NO USB - PRESS PLAY IN PLAYER FOR TEST TONE");
             else mp_open_from_fm(idx);
+        } else if (is_mpg(fm.e[idx].name)) {
+            if (fm.demo) set_status("NO USB - PRESS PLAY IN VIDEO PLAYER FOR TEST PATTERN");
+            else vp_open_from_fm(idx);
         }
         return;
     }
@@ -1390,6 +1404,331 @@ static void mp_click(Win *w, int mx, int my, int frame)
     }
 }
 
+/* ---------- Video Player (MPEG-1 video + MP2 audio, software decode via pl_mpeg) ---------- */
+#define VP_MAX 64
+#define VP_RING (1 << 16)            // shorts (stereo interleaved) = ~0.7 s of audio
+static struct {
+    plm_t *plm;
+    char dir[256];
+    char names[VP_MAX][100];
+    int n, cur, state;               // state: 0 stopped, 1 playing, 2 paused
+    GSTEXTURE tex;
+    int tex_ready, vram_alloc, vw, vh, tw, th;
+    plm_frame_t *last;
+    int new_frame, demo, lagging;
+    unsigned int demo_t;
+    double t0, pause_at, dur, demo_last, fps_t;
+    unsigned int fps, fps_cnt;
+    unsigned int rd, wr;
+    short ring[VP_RING];
+} vp;
+static int vp_full = 0;
+static int cv_rv[256], cv_gu[256], cv_gv[256], cv_bu[256];
+static unsigned char cv_clip[768];
+
+static void vp_init(void)
+{
+    int i;
+    for (i = 0; i < 256; i++) {
+        cv_rv[i] = (91881 * (i - 128)) >> 16;
+        cv_bu[i] = (116130 * (i - 128)) >> 16;
+        cv_gu[i] = 22554 * (i - 128);
+        cv_gv[i] = 46802 * (i - 128);
+    }
+    for (i = 0; i < 768; i++) cv_clip[i] = (unsigned char)clampi(i - 256, 0, 255);
+}
+
+static double vp_now(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static int pow2_at_least(int v, int mn) { int p = mn; while (p < v) p <<= 1; return p; }
+
+static void vp_tex_setup(int w, int h)
+{
+    int i, n;
+    unsigned short *m;
+    vp.vw = w; vp.vh = h;
+    vp.tw = pow2_at_least(w, 64);
+    vp.th = pow2_at_least(h, 64);
+    if (!vp.tex.Mem) vp.tex.Mem = memalign(128, 512 * 512 * 2);
+    if (!vp.tex.Mem) { vp.tex_ready = 0; return; }
+    m = (unsigned short *)vp.tex.Mem;
+    n = vp.tw * vp.th;
+    for (i = 0; i < n; i++) m[i] = 0x8000;                 // opaque black
+    vp.tex.Width = vp.tw; vp.tex.Height = vp.th;
+    vp.tex.PSM = GS_PSM_CT16;
+    vp.tex.Filter = GS_FILTER_LINEAR;
+    if (!vp.vram_alloc) {
+        vp.tex.Vram = gsKit_vram_alloc(gs, gsKit_texture_size(512, 512, GS_PSM_CT16), GSKIT_ALLOC_USERBUFFER);
+        vp.vram_alloc = 1;
+    }
+    gsKit_texture_upload(gs, &vp.tex);
+    vp.tex_ready = 1;
+}
+
+static void vp_convert(plm_frame_t *f)
+{
+    unsigned short *dst = (unsigned short *)vp.tex.Mem;
+    int w = vp.vw, h = vp.vh, tw = vp.tw, x, y;
+    int yw = f->y.width, cw = f->cb.width;
+    for (y = 0; y < h; y += 2) {
+        const unsigned char *Y0 = f->y.data + y * yw, *Y1 = Y0 + yw;
+        const unsigned char *cb = f->cb.data + (y >> 1) * cw, *cr = f->cr.data + (y >> 1) * cw;
+        unsigned short *d0 = dst + y * tw, *d1 = d0 + tw;
+        for (x = 0; x < w; x += 2) {
+            int u = cb[x >> 1], v = cr[x >> 1];
+            int rv = cv_rv[v] + 256, gg = 256 - ((cv_gu[u] + cv_gv[v]) >> 16), bu = cv_bu[u] + 256;
+            int a;
+            a = Y0[x];     d0[x]     = (cv_clip[a + rv] >> 3) | ((cv_clip[a + gg] >> 3) << 5) | ((cv_clip[a + bu] >> 3) << 10) | 0x8000;
+            a = Y0[x + 1]; d0[x + 1] = (cv_clip[a + rv] >> 3) | ((cv_clip[a + gg] >> 3) << 5) | ((cv_clip[a + bu] >> 3) << 10) | 0x8000;
+            a = Y1[x];     d1[x]     = (cv_clip[a + rv] >> 3) | ((cv_clip[a + gg] >> 3) << 5) | ((cv_clip[a + bu] >> 3) << 10) | 0x8000;
+            a = Y1[x + 1]; d1[x + 1] = (cv_clip[a + rv] >> 3) | ((cv_clip[a + gg] >> 3) << 5) | ((cv_clip[a + bu] >> 3) << 10) | 0x8000;
+        }
+    }
+}
+
+static void vp_ring_reset(void) { vp.rd = vp.wr = 0; }
+
+static void vp_video_cb(plm_t *p, plm_frame_t *f, void *u) { (void)p; (void)u; vp.last = f; vp.new_frame = 1; }
+
+static void vp_audio_cb(plm_t *p, plm_samples_t *sm, void *u)
+{
+    unsigned int i, n = sm->count * 2, freeroom;
+    (void)p; (void)u;
+    freeroom = (vp.rd - vp.wr - 1) & (VP_RING - 1);
+    if (freeroom < n) return;                       // ring full: drop this packet
+    for (i = 0; i < n; i++) {
+        float v = sm->interleaved[i] * 32767.0f;
+        if (v > 32767.0f) v = 32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        vp.ring[vp.wr] = (short)v;
+        vp.wr = (vp.wr + 1) & (VP_RING - 1);
+    }
+}
+
+static int vp_rate_ok = 0;
+
+static void vp_audio_pump(int flush)
+{
+    short tmp[2304];
+    int k;
+    if (!audsrv_ok || !vp_rate_ok) return;
+    for (k = 0; k < 4; k++) {
+        unsigned int avail = (vp.wr - vp.rd) & (VP_RING - 1), i, n = 2304;
+        if (avail < n) { if (!flush || avail < 2) break; n = avail & ~1u; }
+        if (audsrv_available() < (int)(n * 2 + 512)) break;
+        for (i = 0; i < n; i++) { tmp[i] = vp.ring[vp.rd]; vp.rd = (vp.rd + 1) & (VP_RING - 1); }
+        audsrv_play_audio((char *)tmp, n * 2);
+    }
+}
+
+static void vp_stop(void)
+{
+    if (vp.plm) { plm_destroy(vp.plm); vp.plm = NULL; }
+    vp.state = 0; vp.tex_ready = 0; vp.last = NULL; vp.new_frame = 0; vp.demo = 0; vp_rate_ok = 0;
+    vp_full = 0;
+    vp_ring_reset();
+    if (audsrv_ok) audsrv_stop_audio();
+}
+
+static int vp_open(int idx)
+{
+    char full[400];
+    int w, h, rate;
+    vp_stop();
+    if (idx < 0 || idx >= vp.n) return -1;
+    snprintf(full, sizeof(full), "%s%s", vp.dir, vp.names[idx]);
+    vp.plm = plm_create_with_filename(full);
+    if (!vp.plm) { set_status("CANT OPEN FILE OR NOT MPEG-1 PS"); return -1; }
+    w = plm_get_width(vp.plm); h = plm_get_height(vp.plm);
+    if (w <= 0 || h <= 0) { plm_destroy(vp.plm); vp.plm = NULL; set_status("NO MPEG-1 VIDEO FOUND"); return -1; }
+    if (w > 512 || h > 512) { plm_destroy(vp.plm); vp.plm = NULL; set_status("VIDEO TOO LARGE (MAX 512X512)"); return -1; }
+    plm_set_video_decode_callback(vp.plm, vp_video_cb, NULL);
+    plm_set_audio_decode_callback(vp.plm, vp_audio_cb, NULL);
+    plm_set_audio_lead_time(vp.plm, 0.25);
+    plm_set_loop(vp.plm, FALSE);
+    vp.dur = plm_get_duration(vp.plm);
+    vp_tex_setup(w, h);
+    if (mp.state == 1) mp.state = 2;                // pause the music player
+    if (audsrv_ok) audsrv_stop_audio();
+    mp.hz = 0;
+    rate = plm_get_samplerate(vp.plm);
+    vp_rate_ok = 0;
+    if (audsrv_ok && rate > 0) {
+        audsrv_fmt_t fmt;
+        fmt.freq = rate; fmt.bits = 16; fmt.channels = 2;
+        audsrv_set_format(&fmt);
+        vp_rate_ok = 1;
+    }
+    vp_ring_reset();
+    vp.cur = idx; vp.state = 1; vp.demo = 0;
+    vp.t0 = vp_now(); vp.fps_t = vp.t0; vp.fps = vp.fps_cnt = 0;
+    return 0;
+}
+
+static void vp_open_from_fm(int idx)
+{
+    int i, cur = 0;
+    vp.n = 0;
+    strncpy(vp.dir, fm.path, sizeof(vp.dir) - 1);
+    vp.dir[sizeof(vp.dir) - 1] = 0;
+    for (i = 0; i < fm.count && vp.n < VP_MAX; i++) {
+        if (!fm.e[i].dir && is_mpg(fm.e[i].name)) {
+            if (i == idx) cur = vp.n;
+            strncpy(vp.names[vp.n], fm.e[i].name, 99);
+            vp.names[vp.n][99] = 0;
+            vp.n++;
+        }
+    }
+    open_app(5);
+    vp_open(cur);
+}
+
+static void vp_next(void)
+{
+    if (vp.cur + 1 < vp.n) vp_open(vp.cur + 1);
+    else { vp_stop(); set_status("END OF PLAYLIST"); }
+}
+
+static void vp_demo_frame(void)
+{
+    unsigned short *m = (unsigned short *)vp.tex.Mem;
+    int x, y, t = (int)vp.demo_t;
+    for (y = 0; y < 120; y++)
+        for (x = 0; x < 160; x++) {
+            int r = (x * 2 + t * 3) & 255, g = (y * 3 + t * 2) & 255, b = (x + y + t * 4) & 255;
+            if (((x >> 4) + (y >> 4) + (t >> 3)) & 1) { r = 255 - r; b = 255 - b; }
+            m[y * vp.tw + x] = (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | 0x8000;
+        }
+    gsKit_texture_upload(gs, &vp.tex);
+}
+
+static void vp_pump(void)
+{
+    double now;
+    if (vp.state != 1) return;
+    now = vp_now();
+    if (vp.demo) {
+        if (now - vp.demo_last >= 0.04) { vp.demo_last = now; vp.demo_t++; vp_demo_frame(); vp.fps_cnt++; }
+    } else if (vp.plm) {
+        double dt = (now - vp.t0) - plm_get_time(vp.plm);
+        vp.lagging = 0;
+        if (dt > 0.1) { dt = 0.1; vp.lagging = 1; }
+        if (dt > 0.0) plm_decode(vp.plm, dt);
+        if (vp.new_frame && vp.last) {
+            vp_convert(vp.last);
+            gsKit_texture_upload(gs, &vp.tex);
+            vp.new_frame = 0;
+            vp.fps_cnt++;
+        }
+        vp_audio_pump(plm_has_ended(vp.plm));
+        if (plm_has_ended(vp.plm) && vp.wr == vp.rd) { vp_next(); return; }
+    }
+    if (now - vp.fps_t >= 1.0) { vp.fps = vp.fps_cnt; vp.fps_cnt = 0; vp.fps_t = now; }
+}
+
+static void vp_draw_fit(int x, int y, int w, int h)
+{
+    int dw, dh, x0, y0;
+    if (!vp.tex_ready || vp.vw <= 0 || vp.vh <= 0) return;
+    if (w * vp.vh > h * vp.vw) { dh = h; dw = h * vp.vw / vp.vh; }
+    else { dw = w; dh = w * vp.vh / vp.vw; }
+    x0 = x + (w - dw) / 2; y0 = y + (h - dh) / 2;
+    gsKit_prim_sprite_texture(gs, &vp.tex, x0, y0, 0, 0, x0 + dw, y0 + dh, vp.vw, vp.vh, 1, GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0));
+}
+
+static void vp_draw_fullscreen(void)
+{
+    if (!vp_full) return;
+    if (!vp.tex_ready) { vp_full = 0; return; }
+    rect(0, 0, gs->Width, gs->Height, RGB(0, 0, 0));
+    vp_draw_fit(0, 0, gs->Width, gs->Height);
+}
+
+static void draw_vp(Win *w)
+{
+    int bx = w->x + 3, by = w->y + TITLE_H, i;
+    char buf[64];
+    int el = (vp.plm && !vp.demo) ? (int)plm_get_time(vp.plm) : (int)(vp.demo_t / 25);
+    int dur = (int)vp.dur;
+    u64 white = RGB(255, 255, 255);
+    rect(bx, by, w->x + w->w - 3, w->y + w->h - 3, RGB(40, 46, 66));
+    rect(bx + 10, by + 7, bx + 334, by + 251, RGB(90, 100, 130));
+    rect(bx + 11, by + 8, bx + 333, by + 250, RGB(0, 0, 0));
+    if (vp.state && vp.tex_ready) vp_draw_fit(bx + 12, by + 9, 320, 240);
+    else draw_text(bx + 120, by + 124, "NO VIDEO", 10, 1, RGB(120, 130, 160));
+    if (vp.demo && vp.state) draw_text(bx + 8, by + 256, "TEST PATTERN (NO FILE)", 54, 1, white);
+    else if (vp.n > 0) {
+        snprintf(buf, sizeof(buf), "%d/%d ", vp.cur + 1, vp.n);
+        draw_text(bx + 8, by + 256, buf, 10, 1, RGB(120, 220, 255));
+        draw_text(bx + 8 + (int)strlen(buf) * 6, by + 256, vp.names[vp.cur], 46, 1, white);
+    } else draw_text(bx + 8, by + 256, "NO FILE - DOUBLE-CLICK AN MPG IN MY COMPUTER", 56, 1, RGB(190, 200, 230));
+    if (dur > 0) snprintf(buf, sizeof(buf), "%02d:%02d / %02d:%02d", el / 60, el % 60, dur / 60, dur % 60);
+    else snprintf(buf, sizeof(buf), "%02d:%02d / --:--", el / 60, el % 60);
+    draw_text(bx + 8, by + 270, buf, 20, 1, RGB(120, 220, 255));
+    snprintf(buf, sizeof(buf), "FPS %u%s", vp.fps, vp.lagging ? "  LAG" : "");
+    draw_text(bx + 230, by + 270, buf, 16, 1, vp.lagging ? RGB(255, 120, 120) : RGB(160, 220, 160));
+    rect(bx + 8, by + 284, bx + 342, by + 290, RGB(90, 100, 130));
+    if (dur > 0) { int fw = (int)(334L * el / dur); if (fw > 334) fw = 334; rect(bx + 8, by + 284, bx + 8 + fw, by + 290, RGB(255, 150, 30)); }
+    for (i = 0; i < 4; i++) {
+        int x0 = bx + 8 + i * 36;
+        rect(x0, by + 296, x0 + 32, by + 320, RGB(170, 180, 205));
+        rect(x0 + 1, by + 297, x0 + 31, by + 319, RGB(225, 228, 240));
+    }
+    rect(bx + 14, by + 301, bx + 16, by + 315, RGB(20, 20, 20)); tri_left(bx + 17, by + 308, RGB(20, 20, 20));
+    if (vp.state == 1) { rect(bx + 54, by + 301, bx + 58, by + 315, RGB(20, 20, 20)); rect(bx + 62, by + 301, bx + 66, by + 315, RGB(20, 20, 20)); }
+    else tri_right(bx + 56, by + 308, RGB(20, 130, 40));
+    rect(bx + 90, by + 302, bx + 102, by + 314, RGB(20, 20, 20));
+    tri_right(bx + 124, by + 308, RGB(20, 20, 20)); rect(bx + 133, by + 301, bx + 135, by + 315, RGB(20, 20, 20));
+    rect(bx + 168, by + 296, bx + 220, by + 320, RGB(170, 180, 205));
+    rect(bx + 169, by + 297, bx + 219, by + 319, RGB(225, 228, 240));
+    draw_text(bx + 180, by + 304, "FULL", 4, 1, RGB(20, 20, 20));
+}
+
+static void vp_click(Win *w, int mx, int my, int frame)
+{
+    int bx = w->x + 3, by = w->y + TITLE_H, i;
+    (void)frame;
+    if (my >= by + 296 && my < by + 320) {
+        for (i = 0; i < 4; i++) {
+            int x0 = bx + 8 + i * 36;
+            if (mx >= x0 && mx < x0 + 32) {
+                if (i == 0) { if (vp.n > 0) vp_open(vp.cur > 0 ? vp.cur - 1 : 0); }
+                else if (i == 1) {
+                    if (vp.state == 1) { vp.state = 2; vp.pause_at = vp_now(); }
+                    else if (vp.state == 2) { vp.t0 += vp_now() - vp.pause_at; vp.state = 1; }
+                    else if (vp.n > 0) vp_open(vp.cur);
+                    else {
+                        vp_stop();
+                        vp_tex_setup(160, 120);
+                        vp.demo = 1; vp.state = 1; vp.demo_t = 0; vp.demo_last = 0; vp.dur = 0;
+                        vp.fps_t = vp_now(); vp.fps = vp.fps_cnt = 0;
+                    }
+                }
+                else if (i == 2) vp_stop();
+                else if (vp.n > 0) vp_next();
+                return;
+            }
+        }
+        if (mx >= bx + 168 && mx < bx + 220) {
+            if (vp.tex_ready && vp.state) { vp_full = 1; set_status("CLICK / ANY BUTTON = EXIT FULLSCREEN"); }
+        }
+        return;
+    }
+    if (my >= by + 280 && my < by + 294 && mx >= bx + 8 && mx < bx + 342 && vp.plm && !vp.demo && vp.dur > 0) {
+        double t = vp.dur * (mx - (bx + 8)) / 334.0;
+        if (audsrv_ok) audsrv_stop_audio();
+        vp_ring_reset();
+        plm_seek(vp.plm, t, FALSE);
+        vp.t0 = vp_now() - plm_get_time(vp.plm);
+        if (vp.state == 2) vp.pause_at = vp_now();
+    }
+}
+
 /* ---------- window manager ---------- */
 static int top_slot(void) { return nopen ? order[nopen - 1] : -1; }
 
@@ -1420,8 +1759,8 @@ static void open_app(int app)
     if (slot < 0) return;
     wins[slot].open = 1;
     wins[slot].app = app;
-    wins[slot].w = (app == 0) ? 400 : (app == 1) ? 198 : (app == 2) ? 312 : (app == 3) ? 360 : (app == 4) ? 320 : 300;
-    wins[slot].h = (app == 0) ? 330 : (app == 1) ? 250 : (app == 2) ? 360 : (app == 3) ? 326 : (app == 4) ? 262 : 200;
+    wins[slot].w = (app == 0) ? 400 : (app == 1) ? 198 : (app == 2) ? 312 : (app == 3) ? 360 : (app == 4) ? 320 : (app == 5) ? 350 : 300;
+    wins[slot].h = (app == 0) ? 330 : (app == 1) ? 250 : (app == 2) ? 360 : (app == 3) ? 326 : (app == 4) ? 262 : (app == 5) ? 356 : 200;
     wins[slot].x = 110 + (nopen % 6) * 28;
     wins[slot].y = 20 + (nopen % 6) * 28;
     order[nopen++] = slot;
@@ -1450,6 +1789,7 @@ static void draw_window(int slot, int active)
     else if (w->app == 1) draw_ms(w);
     else if (w->app == 2) draw_sol(w);
     else if (w->app == 3) draw_mp(w);
+    else if (w->app == 5) draw_vp(w);
     else draw_text(x + 20, y + 80, "COMING SOON", 20, 2, RGB(90, 90, 90));
 }
 
@@ -1639,6 +1979,7 @@ int main(void)
     audsrv_ok = (audsrv_init() == 0);
     poweroffInit();
     mp_init();
+    vp_init();
 
     while (1) {
         int W = gs->Width, H = gs->Height;
@@ -1694,7 +2035,9 @@ int main(void)
 
         if (pressed) {
             int handled = 0;
-            if (menu_open) {
+            if (vp_full) { vp_full = 0; handled = 1; }
+            if (handled) { }
+            else if (menu_open) {
                 int mh = menu_h(), myp = H - TASKBAR_H - mh;
                 if (mx >= 0 && mx < MENU_W && my >= myp && my < myp + mh) {
                     int it = menu_item_at(my, myp);
@@ -1723,6 +2066,7 @@ int main(void)
                     else if (w->app == 1) ms_click(w, mx, my, 0);
                     else if (w->app == 2) sl_click(w, mx, my, 0);
                     else if (w->app == 3) mp_click(w, mx, my, frame);
+                    else if (w->app == 5) vp_click(w, mx, my, frame);
                     handled = 1;
                 }
             }
@@ -1773,6 +2117,7 @@ int main(void)
         prev = buttons;
 
         mp_pump();
+        vp_pump();
         mp_viz_update();
 
         // ----- draw -----
@@ -1788,6 +2133,7 @@ int main(void)
         for (i = 0; i < nopen; i++) draw_window(order[i], i == nopen - 1);
         draw_taskbar(top_slot());
         if (menu_open) draw_menu(mx, my);
+        vp_draw_fullscreen();
         if (frame < status_until) {
             int tw = strlen(status) * 6 + 12;
             rect(W / 2 - tw / 2, 6, W / 2 + tw / 2, 24, RGB(20, 20, 40));
