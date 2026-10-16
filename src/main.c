@@ -263,7 +263,7 @@ static void open_app(int app);
 
 /* ---------- global settings + persistent ini ---------- */
 static int g_vol = 80, stick_dz = 40, cursor_speed = 5;
-static int audsrv_ok = 0, sleeping = 0;
+static int audsrv_ok = 0, sleeping = 0, sleep_wait = 0;
 static int icon_px[NICONS], icon_py[NICONS];
 static int ini_loaded = 0;
 #define INI_PATH "mass:/ps2xp.ini"
@@ -1100,7 +1100,9 @@ static struct {
     char names[MP_MAX][100];
     int n, cur, state, scroll;          // state: 0 stopped, 1 playing, 2 paused
     unsigned char *buf;
-    long size, pos;
+    long size, pos, fill;
+    int eof;
+    FILE *fp;
     mp3dec_t dec;
     int hz, kbps, demo;
     unsigned int played, tone_n;
@@ -1124,8 +1126,26 @@ static void mp_init(void)
     if (audsrv_ok) audsrv_set_volume(g_vol);
 }
 
+#define MP_BUF (192 * 1024)
+
+static void mp_refill(void)
+{
+    size_t want, n;
+    if (!mp.fp || !mp.buf || mp.eof) return;
+    if (mp.pos > 0) {
+        memmove(mp.buf, mp.buf + mp.pos, mp.fill - mp.pos);
+        mp.fill -= mp.pos;
+        mp.pos = 0;
+    }
+    want = MP_BUF - mp.fill;
+    n = fread(mp.buf + mp.fill, 1, want, mp.fp);
+    mp.fill += n;
+    if (n < want) mp.eof = 1;
+}
+
 static void mp_stop(void)
 {
+    if (mp.fp) { fclose(mp.fp); mp.fp = NULL; }
     if (mp.buf) { free(mp.buf); mp.buf = NULL; }
     mp.state = 0;
     if (audsrv_ok) audsrv_stop_audio();
@@ -1150,12 +1170,13 @@ static int mp_load(int idx)
     f = fopen(full, "rb");
     if (!f) { set_status("CANT OPEN FILE"); return -1; }
     fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 20 * 1024 * 1024) { fclose(f); set_status("MP3 TOO BIG (MAX 20 MB)"); return -1; }
-    mp.buf = malloc(sz);
+    if (sz <= 0) { fclose(f); set_status("EMPTY FILE"); return -1; }
+    mp.buf = malloc(MP_BUF);
     if (!mp.buf) { fclose(f); set_status("OUT OF MEMORY"); return -1; }
-    if (fread(mp.buf, 1, sz, f) != (size_t)sz) { fclose(f); free(mp.buf); mp.buf = NULL; set_status("READ ERROR"); return -1; }
-    fclose(f);
-    mp.size = sz; mp.pos = 0; mp.played = 0; mp.hz = 0; mp.kbps = 0; mp.cur = idx;
+    mp.fp = f;
+    mp.size = sz; mp.pos = 0; mp.fill = 0; mp.eof = 0;
+    mp.played = 0; mp.hz = 0; mp.kbps = 0; mp.cur = idx;
+    mp_refill();
     mp3dec_init(&mp.dec);
     mp.state = 1;
     mp_fix_scroll();
@@ -1207,8 +1228,12 @@ static void mp_pump(void)
             }
         } else {
             mp3dec_frame_info_t info;
-            if (!mp.buf || mp.pos >= mp.size) { mp_next(); return; }
-            samples = mp3dec_decode_frame(&mp.dec, mp.buf + mp.pos, (int)(mp.size - mp.pos), pcm, &info);
+            long avail;
+            if (!mp.buf) { mp_next(); return; }
+            avail = mp.fill - mp.pos;
+            if (avail < 16384 && !mp.eof) { mp_refill(); avail = mp.fill - mp.pos; }
+            if (avail <= 0) { mp_next(); return; }
+            samples = mp3dec_decode_frame(&mp.dec, mp.buf + mp.pos, (int)avail, pcm, &info);
             if (info.frame_bytes <= 0) { mp_next(); return; }
             mp.pos += info.frame_bytes;
             if (samples <= 0) continue;
@@ -1587,7 +1612,7 @@ static void power_action(int a)
         if (audsrv_ok) audsrv_quit();
         Exit(0);
     } else if (a == 1) {                // Sleep: black screen until a button is pressed
-        sleeping = 1;
+        sleeping = 1; sleep_wait = 1;
         if (mp.state == 1) mp.state = 2;
     } else {                            // Power off
         if (audsrv_ok) audsrv_stop_audio();
@@ -1654,8 +1679,9 @@ int main(void)
         }
 
         if (sleeping) {
-            if (pad_last || buttons) { sleeping = 0; prev = buttons | 1; pad_prev = pad_last; }
-            else {
+            if (sleep_wait) { if (!pad_last && !buttons) sleep_wait = 0; }   // wait until the menu click is released
+            else if (pad_last || buttons) { sleeping = 0; prev = buttons | 1; pad_prev = pad_last; }
+            if (sleeping) {
                 rect(0, 0, W, H, RGB(0, 0, 0));
                 gsKit_queue_exec(gs);
                 gsKit_sync_flip(gs);
