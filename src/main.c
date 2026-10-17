@@ -1105,6 +1105,90 @@ static void draw_sol(Win *w)
 }
 
 /* ---------- Media Player (MP3 via minimp3 + audsrv, spectrum visualizer) ---------- */
+/* ---------- shared audio helpers: everything is resampled to 48 kHz in software ---------- */
+#define OUT_HZ 48000
+#define RS_CAP 8192
+typedef struct { float phase, step; int l0, r0; } Resamp;
+static short rs_out[RS_CAP * 2];
+static Resamp vp_rs;
+static int audio_stall = 0;
+
+static void audio_set_format(void)
+{
+    audsrv_fmt_t fmt;
+    fmt.freq = OUT_HZ; fmt.bits = 16; fmt.channels = 2;
+    audsrv_set_format(&fmt);
+    audsrv_set_volume(g_vol);
+}
+
+static void audio_reset(void)
+{
+    audsrv_stop_audio();
+    audio_set_format();
+    audio_stall = 0;
+    set_status("AUDIO RESET");
+}
+
+static void rs_init(Resamp *r, int hz)
+{
+    r->step = (float)hz / (float)OUT_HZ;
+    r->phase = 0.0f; r->l0 = 0; r->r0 = 0;
+}
+
+// linear-interpolation resampler, stereo interleaved in/out, returns frames written
+static int rs_run(Resamp *r, const short *in, int n, short *out, int cap)
+{
+    int i, o = 0;
+    if (r->step > 0.999f && r->step < 1.001f) {
+        if (n > cap) n = cap;
+        memcpy(out, in, n * 4);
+        return n;
+    }
+    for (i = 0; i < n; i++) {
+        int l1 = in[2 * i], r1 = in[2 * i + 1];
+        while (r->phase < 1.0f && o < cap) {
+            out[2 * o]     = (short)(r->l0 + (int)((l1 - r->l0) * r->phase));
+            out[2 * o + 1] = (short)(r->r0 + (int)((r1 - r->r0) * r->phase));
+            o++;
+            r->phase += r->step;
+        }
+        r->phase -= 1.0f;
+        r->l0 = l1; r->r0 = r1;
+    }
+    return o;
+}
+
+// push as much as audsrv accepts from a stereo short ring; never writes more than the free space
+static void ring_drain(short *ring, unsigned mask, unsigned *rd, unsigned wr)
+{
+    short tmp[1024];
+    int k;
+    if (!audsrv_ok) return;
+    for (k = 0; k < 8; k++) {
+        unsigned cnt = (wr - *rd) & mask, n = 1024, i;
+        int avail = audsrv_available(), acc;
+        if (k == 0) {
+            if (cnt >= 2 && avail < 512) { if (++audio_stall > 200) { audio_reset(); return; } }
+            else audio_stall = 0;
+        }
+        if (cnt < 2 || avail <= 0) break;
+        if (n > cnt) n = cnt;
+        n &= ~1u;
+        if ((int)(n * 2) > avail) n = ((unsigned)avail / 4) * 2;
+        if (n < 2) break;
+        for (i = 0; i < n; i++) tmp[i] = ring[(*rd + i) & mask];
+        acc = audsrv_play_audio((char *)tmp, n * 2);
+        if (acc <= 0) break;
+        *rd = (*rd + ((unsigned)acc >> 1)) & mask;
+    }
+}
+
+#define MP_FIFO (1 << 16)            // shorts = 32768 stereo frames (~0.68 s)
+static short mp_fifo[MP_FIFO];
+static unsigned mp_frd = 0, mp_fwr = 0;
+static Resamp mp_rs;
+static int mp_ending = 0, mp_end_wait = 0;
+
 #define MP_MAX 64
 #define FFT_N 512
 #define FFT_LOG 9
@@ -1137,7 +1221,7 @@ static void mp_init(void)
         if (e <= prev && i > 0) e = prev + 1;
         bar_edge[i] = e; prev = e;
     }
-    if (audsrv_ok) audsrv_set_volume(g_vol);
+    if (audsrv_ok) audio_set_format();
 }
 
 #define MP_BUF (192 * 1024)
@@ -1162,7 +1246,15 @@ static void mp_stop(void)
     if (mp.fp) { fclose(mp.fp); mp.fp = NULL; }
     if (mp.buf) { free(mp.buf); mp.buf = NULL; }
     mp.state = 0;
+    mp_frd = mp_fwr = 0; mp_ending = 0; mp_end_wait = 0;
     if (audsrv_ok) audsrv_stop_audio();
+}
+
+static void mp_pause(void)
+{
+    if (mp.state != 1) return;
+    mp.state = 2;
+    if (audsrv_ok) audsrv_stop_audio();    // otherwise the last buffer loops on pause
 }
 
 static void mp_fix_scroll(void)
@@ -1223,51 +1315,53 @@ static void mp_open_from_fm(int idx)
 
 static void mp_pump(void)
 {
-    short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME], out[1152 * 2];
-    int iter, i, samples = 0, hz = 44100;
+    short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME], st[1152 * 2];
+    int iter, i, samples = 0, hz = OUT_HZ, o;
     if (mp.state != 1 || !audsrv_ok) return;
-    for (iter = 0; iter < 3; iter++) {
-        if (audsrv_available() < 4608 + 512) break;
+    for (iter = 0; iter < 4 && !mp_ending; iter++) {
+        unsigned free_frames = ((mp_frd - mp_fwr - 1) & (MP_FIFO - 1)) / 2;
+        if (free_frames < 7500) break;
         if (mp.demo) {
             samples = 1152;
             for (i = 0; i < samples; i++) {
-                float t = (float)mp.tone_n++ / 44100.0f;
+                float t = (float)mp.tone_n++ / 48000.0f;
                 float f = 330.0f + 220.0f * sinf(t * 0.8f);
                 float amp = 0.4f * (0.65f + 0.35f * sinf(t * 6.0f));
                 float v;
-                mp.tone_ph += 6.2831853f * f / 44100.0f;
+                mp.tone_ph += 6.2831853f * f / 48000.0f;
                 if (mp.tone_ph > 6.2831853f * 1000.0f) mp.tone_ph = 0;
                 v = sinf(mp.tone_ph) * 0.6f + sinf(mp.tone_ph * 2.01f) * 0.25f + sinf(mp.tone_ph * 3.02f) * 0.12f;
-                out[2 * i] = out[2 * i + 1] = (short)(v * amp * 20000.0f);
+                st[2 * i] = st[2 * i + 1] = (short)(v * amp * 20000.0f);
             }
         } else {
             mp3dec_frame_info_t info;
             long avail;
-            if (!mp.buf) { mp_next(); return; }
+            if (!mp.buf) { mp_ending = 1; break; }
             avail = mp.fill - mp.pos;
             if (avail < 16384 && !mp.eof) { mp_refill(); avail = mp.fill - mp.pos; }
-            if (avail <= 0) { mp_next(); return; }
+            if (avail <= 0) { mp_ending = 1; break; }
             samples = mp3dec_decode_frame(&mp.dec, mp.buf + mp.pos, (int)avail, pcm, &info);
-            if (info.frame_bytes <= 0) { mp_next(); return; }
+            if (info.frame_bytes <= 0) { mp_ending = 1; break; }
             mp.pos += info.frame_bytes;
-            if (samples <= 0) continue;
+            if (samples <= 0 || info.hz <= 0) continue;
+            if (samples > 1152) samples = 1152;
             hz = info.hz;
             if (!mp.kbps) mp.kbps = info.bitrate_kbps;
-            if (info.channels == 1) for (i = 0; i < samples; i++) out[2 * i] = out[2 * i + 1] = pcm[i];
-            else memcpy(out, pcm, samples * 4);
+            if (info.channels == 1) for (i = 0; i < samples; i++) st[2 * i] = st[2 * i + 1] = pcm[i];
+            else memcpy(st, pcm, samples * 4);
         }
-        if (mp.hz != hz) {
-            audsrv_fmt_t fmt;
-            fmt.freq = hz; fmt.bits = 16; fmt.channels = 2;
-            audsrv_set_format(&fmt);
-            mp.hz = hz;
-        }
-        audsrv_play_audio((char *)out, samples * 4);
+        if (mp.hz != hz) { rs_init(&mp_rs, hz); mp.hz = hz; }
+        o = rs_run(&mp_rs, st, samples, rs_out, RS_CAP);
+        for (i = 0; i < o * 2; i++) { mp_fifo[mp_fwr] = rs_out[i]; mp_fwr = (mp_fwr + 1) & (MP_FIFO - 1); }
         mp.played += samples;
         for (i = 0; i < FFT_N; i++) {
             int si = samples - FFT_N + i;
-            mp.vis[i] = (si >= 0) ? (short)(((int)out[2 * si] + out[2 * si + 1]) / 2) : 0;
+            mp.vis[i] = (si >= 0) ? (short)(((int)st[2 * si] + st[2 * si + 1]) / 2) : 0;
         }
+    }
+    ring_drain(mp_fifo, MP_FIFO - 1, &mp_frd, mp_fwr);
+    if (mp_ending && mp_frd == mp_fwr) {          // let the tail of the song finish before switching
+        if (++mp_end_wait > 20) { mp_end_wait = 0; mp_ending = 0; mp_next(); }
     }
 }
 
@@ -1384,7 +1478,7 @@ static void mp_click(Win *w, int mx, int my, int frame)
             if (mx >= x0 && mx < x0 + 32) {
                 if (i == 0) { if (mp.n > 0) mp_load(mp.cur > 0 ? mp.cur - 1 : 0); }
                 else if (i == 1) {
-                    if (mp.state == 1) mp.state = 2;
+                    if (mp.state == 1) mp_pause();
                     else if (mp.state == 2) mp.state = 1;
                     else if (mp.n > 0) mp_load(mp.cur);
                     else { mp.demo = 1; mp.state = 1; mp.hz = 0; mp.played = 0; mp.kbps = 0; }
@@ -1423,6 +1517,7 @@ static struct {
     short ring[VP_RING];
 } vp;
 static int vp_full = 0;
+static int vp_rate_ok = 0;
 static int cv_rv[256], cv_gu[256], cv_gv[256], cv_bu[256];
 static unsigned char cv_clip[768];
 
@@ -1497,33 +1592,28 @@ static void vp_video_cb(plm_t *p, plm_frame_t *f, void *u) { (void)p; (void)u; v
 
 static void vp_audio_cb(plm_t *p, plm_samples_t *sm, void *u)
 {
-    unsigned int i, n = sm->count * 2, freeroom;
+    short tmp[PLM_AUDIO_SAMPLES_PER_FRAME * 2];
+    unsigned int i, n = sm->count, o, freeroom;
     (void)p; (void)u;
-    freeroom = (vp.rd - vp.wr - 1) & (VP_RING - 1);
-    if (freeroom < n) return;                       // ring full: drop this packet
-    for (i = 0; i < n; i++) {
+    if (!vp_rate_ok) return;
+    if (n > PLM_AUDIO_SAMPLES_PER_FRAME) n = PLM_AUDIO_SAMPLES_PER_FRAME;
+    for (i = 0; i < n * 2; i++) {
         float v = sm->interleaved[i] * 32767.0f;
         if (v > 32767.0f) v = 32767.0f;
         if (v < -32768.0f) v = -32768.0f;
-        vp.ring[vp.wr] = (short)v;
-        vp.wr = (vp.wr + 1) & (VP_RING - 1);
+        tmp[i] = (short)v;
     }
+    o = (unsigned int)rs_run(&vp_rs, tmp, (int)n, rs_out, RS_CAP);
+    freeroom = (vp.rd - vp.wr - 1) & (VP_RING - 1);
+    if (freeroom < o * 2) return;                   // ring full: drop this packet
+    for (i = 0; i < o * 2; i++) { vp.ring[vp.wr] = rs_out[i]; vp.wr = (vp.wr + 1) & (VP_RING - 1); }
 }
-
-static int vp_rate_ok = 0;
 
 static void vp_audio_pump(int flush)
 {
-    short tmp[2304];
-    int k;
+    (void)flush;
     if (!audsrv_ok || !vp_rate_ok) return;
-    for (k = 0; k < 4; k++) {
-        unsigned int avail = (vp.wr - vp.rd) & (VP_RING - 1), i, n = 2304;
-        if (avail < n) { if (!flush || avail < 2) break; n = avail & ~1u; }
-        if (audsrv_available() < (int)(n * 2 + 512)) break;
-        for (i = 0; i < n; i++) { tmp[i] = vp.ring[vp.rd]; vp.rd = (vp.rd + 1) & (VP_RING - 1); }
-        audsrv_play_audio((char *)tmp, n * 2);
-    }
+    ring_drain(vp.ring, VP_RING - 1, &vp.rd, vp.wr);
 }
 
 static void vp_stop(void)
@@ -1553,17 +1643,12 @@ static int vp_open(int idx)
     plm_set_loop(vp.plm, FALSE);
     vp.dur = plm_get_duration(vp.plm);
     vp_tex_setup(w, h);
-    if (mp.state == 1) mp.state = 2;                // pause the music player
+    mp_pause();                                     // pause the music player
     if (audsrv_ok) audsrv_stop_audio();
     mp.hz = 0;
     rate = plm_get_samplerate(vp.plm);
     vp_rate_ok = 0;
-    if (audsrv_ok && rate > 0) {
-        audsrv_fmt_t fmt;
-        fmt.freq = rate; fmt.bits = 16; fmt.channels = 2;
-        audsrv_set_format(&fmt);
-        vp_rate_ok = 1;
-    }
+    if (audsrv_ok && rate > 0) { rs_init(&vp_rs, rate); vp_rate_ok = 1; }
     vp_ring_reset();
     vp.cur = idx; vp.state = 1; vp.demo = 0;
     vp.t0 = vp_now(); vp.fps_t = vp.t0; vp.fps = vp.fps_cnt = 0;
@@ -1699,7 +1784,7 @@ static void vp_click(Win *w, int mx, int my, int frame)
             if (mx >= x0 && mx < x0 + 32) {
                 if (i == 0) { if (vp.n > 0) vp_open(vp.cur > 0 ? vp.cur - 1 : 0); }
                 else if (i == 1) {
-                    if (vp.state == 1) { vp.state = 2; vp.pause_at = vp_now(); }
+                    if (vp.state == 1) { vp.state = 2; vp.pause_at = vp_now(); if (audsrv_ok) audsrv_stop_audio(); }
                     else if (vp.state == 2) { vp.t0 += vp_now() - vp.pause_at; vp.state = 1; }
                     else if (vp.n > 0) vp_open(vp.cur);
                     else {
@@ -1953,7 +2038,8 @@ static void power_action(int a)
         Exit(0);
     } else if (a == 1) {                // Sleep: black screen until a button is pressed
         sleeping = 1; sleep_wait = 1;
-        if (mp.state == 1) mp.state = 2;
+        mp_pause();
+        if (vp.state == 1) { vp.state = 2; vp.pause_at = vp_now(); if (audsrv_ok) audsrv_stop_audio(); }
     } else {                            // Power off
         if (audsrv_ok) audsrv_stop_audio();
         poweroffShutdown();
